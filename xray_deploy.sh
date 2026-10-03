@@ -123,12 +123,16 @@ preflight_check() {
 }
 
 install_xray() {
-    local candidate service_start service_bin="" arch work
+    local candidate service_start service_bin="" relay_bin="" arch work
+    service_start=$(systemctl show -p ExecStart --value xray-relay 2>/dev/null || true)
+    if [[ "$service_start" =~ path=([^[:space:]\;]+) ]]; then
+        relay_bin="${BASH_REMATCH[1]}"
+    fi
     service_start=$(systemctl show -p ExecStart --value xray 2>/dev/null || true)
     if [[ "$service_start" =~ path=([^[:space:]\;]+) ]]; then
         service_bin="${BASH_REMATCH[1]}"
     fi
-    for candidate in /etc/xray/bin/xray /usr/local/bin/xray "$service_bin" /usr/local/lib/xray-relay/xray; do
+    for candidate in "$relay_bin" /etc/xray/bin/xray /usr/local/bin/xray "$service_bin" /usr/local/lib/xray-relay/xray; do
         if [[ -x "$candidate" ]] && "$candidate" version 2>/dev/null | grep -q '^Xray '; then
             XRAY_BIN="$candidate"
             echo "复用 Xray 核心: $XRAY_BIN"
@@ -141,7 +145,7 @@ install_xray() {
         *) echo "自动安装仅支持 x86_64 和 ARM64。" >&2; return 1 ;;
     esac
     echo "未检测到可复用的 Xray，正在下载核心（${arch}）..."
-    work=$(mktemp -d)
+    work=$(mktemp -d) || return 1
     if ! curl -fSL --connect-timeout 10 --max-time 120 \
         "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip" -o "$work/xray.zip" \
         || ! unzip -q "$work/xray.zip" xray -d "$work"; then
@@ -149,8 +153,12 @@ install_xray() {
         echo "下载 Xray 核心失败。" >&2
         return 1
     fi
-    install -d -m 755 /usr/local/lib/xray-relay
-    install -m 755 "$work/xray" /usr/local/lib/xray-relay/xray
+    if ! install -d -m 755 /usr/local/lib/xray-relay \
+        || ! install -m 755 "$work/xray" /usr/local/lib/xray-relay/xray; then
+        rm -rf -- "$work"
+        echo "无法安装 Xray 核心，请检查目录权限和磁盘空间。" >&2
+        return 1
+    fi
     rm -rf -- "$work"
     XRAY_BIN=/usr/local/lib/xray-relay/xray
     echo "Xray 核心已安装: $XRAY_BIN"
@@ -201,15 +209,15 @@ collect_nodes() {
 
 generate_keys() {
     local key_output
-    key_output=$("$XRAY_BIN" x25519)
+    key_output=$("$XRAY_BIN" x25519) || return 1
     PRIVATE_KEY=$(awk -F ': *' 'tolower($1) ~ /^private ?key$/ {print $2}' <<< "$key_output")
     PUBLIC_KEY=$(awk -F ': *' 'tolower($1) ~ /public|^password/ {print $2; exit}' <<< "$key_output")
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
         echo "Xray 未返回有效的 REALITY 密钥对。" >&2
         return 1
     fi
-    UUID=$(python3 -c 'import uuid; print(uuid.uuid4())')
-    SHORT_ID=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
+    UUID=$(python3 -c 'import uuid; print(uuid.uuid4())') || return 1
+    SHORT_ID=$(python3 -c 'import secrets; print(secrets.token_hex(8))') || return 1
 }
 
 generate_config() {
@@ -344,8 +352,8 @@ PYEOF
 
 apply_config_permissions() {
     local target="$1" group
-    group=$(id -gn nobody)
-    chown "root:$group" "$target"
+    group=$(id -gn nobody) || return 1
+    chown "root:$group" "$target" || return 1
     chmod 640 "$target"
 }
 
@@ -453,7 +461,13 @@ restart_with_rollback() {
         fi
         echo "已恢复原中转配置，但服务未恢复，请检查 journalctl -u xray-relay。" >&2
     else
-        echo "启动失败，请检查 journalctl -u xray-relay。" >&2
+        if ! systemctl stop xray-relay; then
+            echo "启动失败，且无法停止 xray-relay，请检查 journalctl -u xray-relay。" >&2
+            return 1
+        fi
+        systemctl disable xray-relay || return 1
+        rm -f -- "$CONFIG_FILE" || return 1
+        echo "首次启动失败，已停止服务并撤销本次配置，可从部署菜单重试。" >&2
     fi
     return 1
 }
@@ -487,8 +501,13 @@ if ":" in host:
 lines = []
 for index, inbound in enumerate(config["inbounds"], 1):
     reality = inbound["streamSettings"]["realitySettings"]
-    key = subprocess.run([os.environ["XRAY_BIN"], "x25519", "-i", reality["privateKey"]],
-                         capture_output=True, text=True, check=True)
+    try:
+        key = subprocess.run([os.environ["XRAY_BIN"], "x25519", "-i", reality["privateKey"]],
+                             capture_output=True, text=True)
+    except OSError:
+        raise SystemExit("无法生成节点链接：Xray 核心无法执行。")
+    if key.returncode:
+        raise SystemExit(f"无法生成节点链接：公钥派生失败（退出码 {key.returncode}）。")
     public_key = re.search(r'^(?:Public\s*Key|Password[^:]*):\s*(\S+)', key.stdout, re.I | re.M)
     if not public_key:
         raise SystemExit("无法生成节点链接：Xray 未返回公钥。")
@@ -577,7 +596,7 @@ apply_change() {
         rm -f -- "$NEW_CONFIG"
         return 1
     fi
-    if [[ -f "$SERVICE_FILE" ]]; then
+    if [[ -f "$SERVICE_FILE" ]] && grep -Fxq "ExecStart=\"$XRAY_BIN\" run -config \"$CONFIG_FILE\"" "$SERVICE_FILE"; then
         restart_with_rollback || return 1
     else
         start_service || return 1

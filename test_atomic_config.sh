@@ -16,6 +16,7 @@ cat > "$TMP_DIR/xray" <<'EOF'
 case "$1" in
     version) echo 'Xray test-core' ;;
     x25519)
+        if [[ "${FAIL_DERIVE:-0}" == 1 && "$#" -gt 1 ]]; then exit 9; fi
         if [[ -n "$XRAY_TEST_BIN" ]]; then
             "$XRAY_TEST_BIN" "$@"
         else
@@ -49,14 +50,49 @@ systemctl() {
             [[ "$MODE" != rollback || "$RESTARTS" -gt 1 ]]
             ;;
         is-active) [[ "$MODE" != rollback || "$RESTARTS" -gt 1 ]] ;;
-        daemon-reload|enable) return 0 ;;
+        daemon-reload|enable|stop|disable) return 0 ;;
         *) return 1 ;;
     esac
 }
+# 配置权限错误必须在 chmod 之前停止，即使调用方通过 if 检查返回值。
+(
+    chown() { return 1; }
+    chmod() { touch "$TMP_DIR/unexpected-chmod"; }
+    if apply_config_permissions "$TMP_DIR/permissions.json"; then
+        echo '属组设置失败不得报告成功' >&2; exit 1
+    fi
+    [[ ! -e "$TMP_DIR/unexpected-chmod" ]]
+)
+# 核心安装失败不得继续设置 XRAY_BIN 或打印成功。
+(
+    systemctl() { return 1; }
+    # 屏蔽宿主已有核心，使测试只进入安装分支。
+    grep() { return 1; }
+    curl() { :; }
+    unzip() { :; }
+    install() { return 1; }
+    export TMPDIR="$TMP_DIR"
+    XRAY_BIN=""
+    if install_xray > "$TMP_DIR/install-failed.out" 2>&1; then
+        echo '核心安装失败不得报告成功' >&2; exit 1
+    fi
+    [[ -z "$XRAY_BIN" ]]
+)
 MODE=success RESTARTS=0
 curl() { echo '不应重复下载核心' >&2; return 1; }
 install_xray > "$TMP_DIR/detection.out"
 [[ -x "$XRAY_BIN" ]]
+(
+    systemctl() {
+        if [[ "${*: -1}" == xray-relay ]]; then
+            printf '{ path=%s ; }\n' "$TMP_DIR/xray"
+        else
+            printf '{ path=%s ; }\n' "$TMP_DIR/unused-xray"
+        fi
+    }
+    install_xray > "$TMP_DIR/relay-detection.out"
+    [[ "$XRAY_BIN" == "$TMP_DIR/xray" ]]
+)
 XRAY_BIN="$TMP_DIR/xray"
 generate_keys
 [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && "$PUBLIC_KEY" != ignored ]]
@@ -112,6 +148,15 @@ if grep -Eq '^(restart|enable) xray$' "$CALLS"; then
 fi
 print_result > "$TMP_DIR/result.out"
 [[ $(stat -c %a "$INFO_FILE") == 600 ]]
+cp "$INFO_FILE" "$TMP_DIR/before-derive.links"
+if FAIL_DERIVE=1 print_result > "$TMP_DIR/derive-failed.out" 2>&1; then
+    echo '派生失败不得报告成功' >&2; exit 1
+fi
+grep -q '公钥派生失败' "$TMP_DIR/derive-failed.out"
+if grep -Fq "$PRIVATE_KEY" "$TMP_DIR/derive-failed.out"; then
+    echo '派生失败不得泄露私钥参数' >&2; exit 1
+fi
+cmp "$INFO_FILE" "$TMP_DIR/before-derive.links"
 python3 - "$CONFIG_FILE" "$INFO_FILE" <<'PYEOF'
 import json, sys
 from urllib.parse import urlsplit, parse_qs
@@ -136,6 +181,31 @@ fi
 cmp "$CONFIG_FILE" "$TMP_DIR/original.json"
 [[ $(stat -c %a "$CONFIG_FILE") == 640 ]]
 MODE=success RESTARTS=0
+# 首次启动失败应停止重启循环、撤销新配置，返回首次部署菜单。
+(
+    CONFIG_FILE="$TMP_DIR/failed-first.json"
+    cp "$TMP_DIR/original.json" "$CONFIG_FILE"
+    CONFIG_BACKUP=""
+    systemctl() {
+        printf '%s\n' "$*" >> "$TMP_DIR/failed-first.calls"
+        case "$1" in
+            stop|disable) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    journalctl() { echo 'test startup failure'; }
+    if restart_with_rollback > "$TMP_DIR/failed-first.out" 2>&1; then exit 1; fi
+    [[ ! -e "$CONFIG_FILE" ]]
+    grep -qx 'stop xray-relay' "$TMP_DIR/failed-first.calls"
+    grep -qx 'disable xray-relay' "$TMP_DIR/failed-first.calls"
+)
+# 已部署服务引用的核心被移除时，复用新核心后同步更新自身服务路径。
+(
+    SERVICE_FILE="$TMP_DIR/replaced-core.service"
+    printf '%s\n' '[Service]' 'ExecStart=/missing/xray run -config /missing/config.json' > "$SERVICE_FILE"
+    apply_change switch-outbound vless-in-1 socks5-vless-in-1-1 > "$TMP_DIR/replaced-core.out"
+    grep -Fqx "ExecStart=\"$XRAY_BIN\" run -config \"$CONFIG_FILE\"" "$SERVICE_FILE"
+)
 cp "$INFO_FILE" "$TMP_DIR/original.links"
 parse_socks5_raw 'socks5://third.example:1082'
 NODES=("${PARSED_HOST}"$'\x1f'"${PARSED_PORT}"$'\x1f'"${PARSED_USER}"$'\x1f'"${PARSED_PASS}")

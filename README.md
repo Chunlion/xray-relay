@@ -32,7 +32,7 @@ START_PORT=30000 REALITY_SERVER_NAME=www.apple.com bash xray_deploy.sh
 
 ## 与已有 Xray 共存
 
-自动检测 233boy 的 `/etc/xray/bin/xray`、官方安装的 `/usr/local/bin/xray` 及 `xray.service` 使用的核心，找到后直接复用。未找到时，仅下载 Xray 核心至 `/usr/local/lib/xray-relay/xray`，自动下载支持 x86_64 / ARM64。
+优先复用已部署的 `xray-relay.service` 所用核心，再检测 233boy 的 `/etc/xray/bin/xray`、官方安装的 `/usr/local/bin/xray` 及 `xray.service` 使用的核心。未找到时，仅下载 Xray 核心至 `/usr/local/lib/xray-relay/xray`，自动下载支持 x86_64 / ARM64。更换核心路径后会同步更新中转服务。
 
 使用独立的 `xray-relay.service` 和 `/usr/local/etc/xray-relay/config.json`，不修改或重启已有 `xray.service`，不占用已监听的端口。原脚本更新或卸载共享核心后，中转服务也需要该核心继续存在。
 
@@ -40,7 +40,7 @@ START_PORT=30000 REALITY_SERVER_NAME=www.apple.com bash xray_deploy.sh
 
 新增出站保留 VLESS 的 UUID、密钥、端口及当前出口。备用出站需从菜单手动切换；删除当前出口会选择第一个剩余出站，最后一个出站不能删除。修改端口后需重新导入节点链接。
 
-上一版的一对一配置仍可管理，编辑时只转换选中的 VLESS。每次修改先校验并备份原配置，启动失败尝试恢复本次备份。校验失败会显示核心路径、退出码和隐藏凭据后的具体错误；首次部署失败可从菜单重试。
+上一版的一对一配置仍可管理，编辑时只转换选中的 VLESS。每次修改先校验并备份原配置，启动失败尝试恢复本次备份。首次启动失败会停止并禁用中转服务、撤销本次配置，返回部署菜单。校验失败会显示核心路径、退出码和隐藏凭据后的具体错误。
 
 ```bash
 systemctl status xray-relay
