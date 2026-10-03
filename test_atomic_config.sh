@@ -23,7 +23,10 @@ case "$1" in
         fi
         ;;
     run)
-        if grep -q '"reject":true' "$4"; then exit 1; fi
+        if grep -q '"reject":true' "$4"; then
+            echo 'mock configuration rejected: diagnostic-user diagnostic-password diagnostic-id diagnostic-private' >&2
+            exit 1
+        fi
         if [[ -n "$XRAY_TEST_BIN" ]]; then
             if ! "$XRAY_TEST_BIN" "$@" > "${4}.check.log" 2>&1; then
                 cat "${4}.check.log" >&3
@@ -88,9 +91,14 @@ assert config["routing"]["domainStrategy"] == "AsIs"
 PYEOF
 cp "$TMP_DIR/new.json" "$CONFIG_FILE"
 cp "$CONFIG_FILE" "$TMP_DIR/original.json"
-printf '%s\n' '{"reject":true}' > "$TMP_DIR/bad.json"
+printf '%s\n' '{"reject":true,"user":"diagnostic-user","pass":"diagnostic-password","id":"diagnostic-id","privateKey":"diagnostic-private"}' > "$TMP_DIR/bad.json"
 if validate_and_install_config "$TMP_DIR/bad.json" > "$TMP_DIR/error.out" 2>&1; then
     echo '校验失败应返回非零' >&2; exit 1
+fi
+grep -q 'mock configuration rejected' "$TMP_DIR/error.out"
+grep -q '\[隐藏\]' "$TMP_DIR/error.out"
+if grep -Eq 'diagnostic-(user|password|id|private)' "$TMP_DIR/error.out"; then
+    echo '错误提示不得包含账号、密码、UUID 或私钥' >&2; exit 1
 fi
 cmp "$CONFIG_FILE" "$TMP_DIR/original.json"
 validate_and_install_config "$TMP_DIR/new.json"
@@ -249,7 +257,48 @@ fi
 if collect_nodes </dev/null > "$TMP_DIR/eof.out" 2>&1; then
     echo '空输入不得部署' >&2; exit 1
 fi
+# 首次运行展示菜单，失败后可重试，成功后进入管理菜单。
+CONFIG_FILE="$TMP_DIR/first/config.json"
+INFO_FILE="$TMP_DIR/first/nodes.txt"
+SERVICE_FILE="$TMP_DIR/first/relay.service"
+START_PORT=20000
+MODE=success RESTARTS=0
+preflight_check() { :; }
+get_ip() { echo 203.0.113.10; }
+ss() { :; }
+# 两次部署复用同一核心，第一次模拟校验失败。
+install_xray() { XRAY_BIN="$TMP_DIR/xray"; }
+DEPLOY_ATTEMPTS=0
+generate_config_original=$(declare -f generate_config)
+eval "${generate_config_original/generate_config ()/generate_config_original ()}"
+generate_config() {
+    DEPLOY_ATTEMPTS=$((DEPLOY_ATTEMPTS + 1))
+    if [[ "$DEPLOY_ATTEMPTS" == 1 ]]; then
+        printf '%s\n' '{"reject":true,"user":"diagnostic-user","pass":"diagnostic-password","id":"diagnostic-id","privateKey":"diagnostic-private"}' > "$1"
+    else
+        generate_config_original "$@"
+    fi
+}
+(main <<'EOF'
+1
+socks5://proxy.example:1080
+
+1
+socks5://proxy.example:1080
+
+0
+EOF
+) > "$TMP_DIR/first.out" 2>&1
+grep -q '1) 部署 VLESS + SOCKS5' "$TMP_DIR/first.out"
+grep -q 'mock configuration rejected' "$TMP_DIR/first.out"
+grep -q '部署失败。' "$TMP_DIR/first.out"
+grep -q '配置校验通过。' "$TMP_DIR/first.out"
+grep -q '3) 为 VLESS 添加 SOCKS5 出站' "$TMP_DIR/first.out"
+if grep -Eq 'diagnostic-(user|password|id|private)' "$TMP_DIR/first.out"; then
+    echo '首次部署错误提示不得泄露凭据' >&2; exit 1
+fi
+[[ -f "$CONFIG_FILE" ]]
 if [[ -n "$XRAY_TEST_BIN" ]]; then
     echo 'PASS: 配置通过真实 Xray 核心校验'
 fi
-echo 'PASS: 核心复用、多出站、手动切换、菜单编辑、旧配置兼容、端口避让和失败回滚'
+echo 'PASS: 首次部署菜单、失败重试、错误详情隐藏凭据、多出站编辑和失败回滚'

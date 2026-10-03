@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/Chunlion/xray-relay/main/xray_deplo
 bash xray_deploy.sh
 ```
 
-首次运行生成一个 VLESS。逐行粘贴它的 SOCKS5 出站链接，全部输入后按空回车结束；第一条作为当前出口。输入隐藏，支持：
+首次运行显示部署菜单，选择 `1` 创建一个 VLESS。逐行粘贴它的 SOCKS5 出站链接，全部输入后按空回车结束；第一条作为当前出口。输入隐藏，支持：
 
 ```text
 socks5://user:password@host:1080
@@ -40,7 +40,7 @@ START_PORT=30000 REALITY_SERVER_NAME=www.apple.com bash xray_deploy.sh
 
 新增出站保留 VLESS 的 UUID、密钥、端口及当前出口。备用出站需从菜单手动切换；删除当前出口会选择第一个剩余出站，最后一个出站不能删除。修改端口后需重新导入节点链接。
 
-上一版的一对一配置仍可管理，编辑时只转换选中的 VLESS。每次修改先校验并备份原配置，启动失败尝试恢复本次备份。
+上一版的一对一配置仍可管理，编辑时只转换选中的 VLESS。每次修改先校验并备份原配置，启动失败尝试恢复本次备份。校验失败会显示核心路径、退出码和隐藏凭据后的具体错误；首次部署失败可从菜单重试。
 
 ```bash
 systemctl status xray-relay

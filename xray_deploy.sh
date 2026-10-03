@@ -140,6 +140,7 @@ install_xray() {
         aarch64|arm64) arch=arm64-v8a ;;
         *) echo "自动安装仅支持 x86_64 和 ARM64。" >&2; return 1 ;;
     esac
+    echo "未检测到可复用的 Xray，正在下载核心（${arch}）..."
     work=$(mktemp -d)
     if ! curl -fSL --connect-timeout 10 --max-time 120 \
         "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip" -o "$work/xray.zip" \
@@ -152,6 +153,7 @@ install_xray() {
     install -m 755 "$work/xray" /usr/local/lib/xray-relay/xray
     rm -rf -- "$work"
     XRAY_BIN=/usr/local/lib/xray-relay/xray
+    echo "Xray 核心已安装: $XRAY_BIN"
 }
 
 get_ip() {
@@ -186,6 +188,7 @@ collect_nodes() {
         [[ -n "$raw" ]] || break
         if parse_socks5_raw "$raw"; then
             NODES+=("${PARSED_HOST}"$'\x1f'"${PARSED_PORT}"$'\x1f'"${PARSED_USER}"$'\x1f'"${PARSED_PASS}")
+            echo "已添加出站 ${#NODES[@]}: ${PARSED_HOST}:${PARSED_PORT}"
         else
             echo "格式错误: $PARSE_ERROR" >&2
         fi
@@ -346,11 +349,47 @@ apply_config_permissions() {
     chmod 640 "$target"
 }
 
+show_xray_error() {
+    ERROR_OUTPUT="$2" python3 - "$1" <<'PYEOF'
+import json, os, re, sys
+output = os.environ["ERROR_OUTPUT"]
+secrets = set()
+def collect(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in {"id", "privatekey", "pass", "password", "user", "username"} and isinstance(item, str) and item:
+                secrets.add(item)
+                secrets.add(json.dumps(item, ensure_ascii=False)[1:-1])
+            else:
+                collect(item)
+    elif isinstance(value, list):
+        for item in value:
+            collect(item)
+try:
+    with open(sys.argv[1]) as file:
+        collect(json.load(file))
+except (OSError, ValueError):
+    pass
+for secret in sorted(secrets, key=len, reverse=True):
+    pattern = re.escape(secret)
+    if len(secret) < 4:
+        pattern = r'(?<![\w])' + pattern + r'(?![\w])'
+    output = re.sub(pattern, "[隐藏]", output)
+print("\n".join(output.splitlines()[-15:])[:12000] or "Xray 未返回错误详情。", file=sys.stderr)
+PYEOF
+}
+
 validate_and_install_config() {
-    local new_config="$1"
+    local new_config="$1" output status
     CONFIG_BACKUP=""
-    if ! "$XRAY_BIN" run -test -config "$new_config" >/dev/null 2>&1; then
-        echo "Xray 配置校验失败，原配置未修改。" >&2
+    echo "正在校验 Xray 配置..."
+    if output=$("$XRAY_BIN" run -test -config "$new_config" 2>&1); then
+        echo "配置校验通过。"
+    else
+        status=$?
+        echo "Xray 配置校验失败（退出码 ${status}），原配置未修改。" >&2
+        echo "核心: $XRAY_BIN" >&2
+        show_xray_error "$new_config" "$output"
         return 1
     fi
     apply_config_permissions "$new_config" || return 1
@@ -389,12 +428,19 @@ EOF
 }
 
 restart_with_rollback() {
+    local since output
+    since=$(date +%s)
+    echo "正在启动 xray-relay 服务..."
     if systemctl restart xray-relay; then
         sleep 2
         if systemctl is-active --quiet xray-relay; then
+            echo "xray-relay 服务运行中。"
             return 0
         fi
     fi
+    echo "xray-relay 启动失败，服务日志：" >&2
+    output=$(journalctl -u xray-relay --since "@$since" -n 15 --no-pager 2>&1 || true)
+    show_xray_error "$CONFIG_FILE" "$output"
     if [[ -n "$CONFIG_BACKUP" ]]; then
         cp -a "$CONFIG_BACKUP" "$CONFIG_FILE" || return 1
         apply_config_permissions "$CONFIG_FILE" || return 1
@@ -543,6 +589,20 @@ apply_change() {
     echo "配置已更新。"
 }
 
+deploy_vless() {
+    echo "创建一个 VLESS，输入的多个 SOCKS5 将作为它的出站，第一条为当前出口。"
+    collect_nodes || return 1
+    echo "正在获取 VPS 公网 IP..."
+    VPS_IP=$(get_ip) || return 1
+    echo "正在检查 Xray 核心..."
+    install_xray || return 1
+    echo "正在生成 VLESS UUID 和 REALITY 密钥..."
+    generate_keys || return 1
+    install -d -m 755 "$(dirname "$CONFIG_FILE")" || return 1
+    echo "正在生成配置，从 ${START_PORT} 开始分配空闲端口..."
+    apply_change add-vless
+}
+
 manage_menu() {
     local choice raw action
     while true; do
@@ -561,8 +621,8 @@ manage_menu() {
             0) return 0 ;;
             1) show_nodes ;;
             2)
-                if collect_nodes && VPS_IP=$(get_ip) && generate_keys; then
-                    if ! apply_change add-vless; then echo "操作失败。" >&2; fi
+                if ! deploy_vless; then
+                    echo "新增 VLESS 失败，请根据以上错误修正后重试。" >&2
                 fi
                 ;;
             3|4|5|6|7)
@@ -614,25 +674,33 @@ manage_menu() {
 }
 
 main() {
+    local choice
     preflight_check
     trap '[[ -z "$NEW_CONFIG" ]] || rm -f -- "$NEW_CONFIG"' EXIT
-    if [[ -f "$CONFIG_FILE" ]]; then
-        install_xray
-        manage_menu
-        return
-    fi
-    collect_nodes
-    VPS_IP=$(get_ip)
-    install_xray
-    generate_keys
-    install -d -m 755 "$(dirname "$CONFIG_FILE")"
-    NEW_CONFIG=$(mktemp --suffix=.json "${CONFIG_FILE}.new.XXXXXX")
-    generate_config "$NEW_CONFIG"
-    validate_and_install_config "$NEW_CONFIG"
-    start_service
-    setup_firewall
-    print_result
-    manage_menu
+    echo "Xray VLESS → SOCKS5"
+    while true; do
+        if [[ -f "$CONFIG_FILE" ]]; then
+            install_xray
+            echo "已检测到中转配置，进入管理菜单。"
+            manage_menu
+            return
+        fi
+        echo
+        echo "1) 部署 VLESS + SOCKS5"
+        echo "0) 退出"
+        prompt_read choice -p "选择: " || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1)
+                if deploy_vless; then
+                    manage_menu
+                    return
+                fi
+                echo "部署失败。请根据以上错误修正后选择 1 重试，或选择 0 退出。" >&2
+                ;;
+            *) echo "选项无效。" >&2 ;;
+        esac
+    done
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
