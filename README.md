@@ -1,6 +1,6 @@
 # xray-relay
 
-VLESS + REALITY 入口 → SOCKS5 出站。逐行输入多个 SOCKS5 链接，每个出口生成一个独立端口的 VLESS 节点。
+VLESS + REALITY 入口 → SOCKS5 出站。一个 VLESS 可绑定多个 SOCKS5，手动选择当前出口。
 
 ## 使用
 
@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/Chunlion/xray-relay/main/xray_deplo
 bash xray_deploy.sh
 ```
 
-粘贴 SOCKS5 链接，全部输入后按空回车结束。输入隐藏，支持：
+首次运行生成一个 VLESS。逐行粘贴它的 SOCKS5 出站链接，全部输入后按空回车结束；第一条作为当前出口。输入隐藏，支持：
 
 ```text
 socks5://user:password@host:1080
@@ -36,7 +36,11 @@ START_PORT=30000 REALITY_SERVER_NAME=www.apple.com bash xray_deploy.sh
 
 使用独立的 `xray-relay.service` 和 `/usr/local/etc/xray-relay/config.json`，不修改或重启已有 `xray.service`，不占用已监听的端口。原脚本更新或卸载共享核心后，中转服务也需要该核心继续存在。
 
-再次运行会重新生成本工具的全部中转节点，替换本工具配置并备份原配置；校验失败保留原配置，启动失败尝试恢复本次备份。旧节点链接随配置替换失效。
+部署完成后进入管理菜单；再次执行 `bash xray_deploy.sh` 也会进入菜单，保留已有节点。可新增 VLESS、向指定 VLESS 添加出站、切换当前出口、编辑或删除 SOCKS5，以及修改 VLESS 名称和端口。
+
+新增出站保留 VLESS 的 UUID、密钥、端口及当前出口。备用出站需从菜单手动切换；删除当前出口会选择第一个剩余出站，最后一个出站不能删除。修改端口后需重新导入节点链接。
+
+上一版的一对一配置仍可管理，编辑时只转换选中的 VLESS。每次修改先校验并备份原配置，启动失败尝试恢复本次备份。
 
 ```bash
 systemctl status xray-relay

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VLESS + REALITY 入口，每个入口对应一个 SOCKS5 出站。
+# VLESS + REALITY 入口，每个入口可绑定多个 SOCKS5 出站。
 set -euo pipefail
 umask 077
 
@@ -13,6 +13,7 @@ START_PORT="${START_PORT:-20000}"
 XRAY_BIN=""
 CONFIG_BACKUP=""
 NEW_CONFIG=""
+NODES=()
 
 prompt_read() {
     local variable="$1" value
@@ -209,43 +210,130 @@ generate_keys() {
 }
 
 generate_config() {
-    local target="$1" occupied
-    occupied=$(ss -H -ltn)
-    NEW_CONFIG_FILE="$target" VPS_IP="$VPS_IP" UUID="$UUID" PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
+    local target="$1" action="${2:-add-vless}" entry="${3:-}" outbound="${4:-}" occupied
+    occupied=$(ss -H -ltn) || return 1
+    CONFIG_FILE="$CONFIG_FILE" NEW_CONFIG_FILE="$target" ACTION="$action" ENTRY_TAG="$entry" \
+    OUTBOUND_TAG="$outbound" EDIT_PORT="${EDIT_PORT:-}" EDIT_NAME="${EDIT_NAME:-}" \
+    VPS_IP="${VPS_IP:-}" UUID="${UUID:-}" PRIVATE_KEY="${PRIVATE_KEY:-}" SHORT_ID="${SHORT_ID:-}" \
     START_PORT="$START_PORT" OCCUPIED="$occupied" REALITY_DEST="$REALITY_DEST" \
     REALITY_SERVER_NAME="$REALITY_SERVER_NAME" NODES_DATA="$(printf '%s\n' "${NODES[@]}")" \
     python3 - <<'PYEOF'
-import json, os
+import copy, json, os, re
+source = os.environ["CONFIG_FILE"]
+if os.path.isfile(source):
+    with open(source) as file:
+        config = json.load(file)
+else:
+    config = {"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [],
+              "routing": {"domainStrategy": "AsIs", "rules": []}}
+inbounds, outbounds, rules = config["inbounds"], config["outbounds"], config["routing"]["rules"]
+action, entry_tag, outbound_tag = (os.environ[key] for key in ("ACTION", "ENTRY_TAG", "OUTBOUND_TAG"))
+nodes = [node for node in os.environ["NODES_DATA"].splitlines() if node]
 used = {int(line.split()[3].rsplit(":", 1)[1])
         for line in os.environ["OCCUPIED"].splitlines() if line.strip()}
-port = int(os.environ["START_PORT"])
-inbounds, outbounds = [], []
-for index, node in enumerate(os.environ["NODES_DATA"].splitlines(), 1):
-    host, socks_port, user, password = node.split("\x1f")
+
+def add_outbounds(prefix):
+    added = []
+    for node in nodes:
+        host, port, user, password = node.split("\x1f")
+        index = 1
+        while any(out["tag"] == f"{prefix}{index}" for out in outbounds):
+            index += 1
+        server = {"address": host, "port": int(port)}
+        if user:
+            server["users"] = [{"user": user, "pass": password}]
+        out = {"tag": f"{prefix}{index}", "protocol": "socks", "settings": {"servers": [server]}}
+        outbounds.append(out)
+        added.append(out)
+    return added
+
+if action == "add-vless":
+    if not nodes:
+        raise SystemExit("至少需要一个 SOCKS5 出站。")
+    used.update(inbound["port"] for inbound in inbounds)
+    port = int(os.environ["START_PORT"])
     while port in used:
         port += 1
     if port > 65535:
         raise SystemExit("没有可用的监听端口。")
-    inbounds.append({
-        "tag": f"vless-in-{index}", "listen": "::" if ":" in os.environ["VPS_IP"] else "0.0.0.0",
-        "port": port, "protocol": "vless",
+    index = 1
+    while any(inbound["tag"] == f"vless-in-{index}" for inbound in inbounds):
+        index += 1
+    entry_tag = f"vless-in-{index}"
+    inbound = {
+        "tag": entry_tag, "_remark": f"VLESS-{index}",
+        "listen": "::" if ":" in os.environ["VPS_IP"] else "0.0.0.0", "port": port, "protocol": "vless",
         "settings": {"clients": [{"id": os.environ["UUID"], "flow": "xtls-rprx-vision"}], "decryption": "none"},
         "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
             "dest": os.environ["REALITY_DEST"], "serverNames": [os.environ["REALITY_SERVER_NAME"]],
             "privateKey": os.environ["PRIVATE_KEY"], "shortIds": [os.environ["SHORT_ID"]]}}
-    })
-    server = {"address": host, "port": int(socks_port)}
-    if user:
-        server["users"] = [{"user": user, "pass": password}]
-    outbounds.append({"tag": f"socks5-out-{index}", "protocol": "socks", "settings": {"servers": [server]}})
-    used.add(port)
-    port += 1
-config = {
-    "log": {"loglevel": "warning"}, "inbounds": inbounds, "outbounds": outbounds,
-    "routing": {"domainStrategy": "AsIs", "rules": [
-        {"type": "field", "inboundTag": [inbound["tag"]], "outboundTag": outbound["tag"]}
-        for inbound, outbound in zip(inbounds, outbounds)]}
-}
+    }
+    inbounds.append(inbound)
+    added = add_outbounds(f"socks5-{entry_tag}-")
+    rules.append({"type": "field", "inboundTag": [entry_tag], "outboundTag": added[0]["tag"]})
+else:
+    inbound = next((item for item in inbounds if item["tag"] == entry_tag), None)
+    rule = next((item for item in rules if item.get("inboundTag") == [entry_tag]), None)
+    if not inbound or not rule:
+        raise SystemExit("VLESS 或对应路由不存在。")
+    prefix = f"socks5-{entry_tag}-"
+    members = [out for out in outbounds if out["tag"].startswith(prefix)]
+    # 将上一版一对一的出站纳入该入口，保持其他入口的路由不变。
+    if not members:
+        old = next((out for out in outbounds if out["tag"] == rule.get("outboundTag")), None)
+        if not old or old["protocol"] != "socks":
+            raise SystemExit("找不到该 VLESS 的 SOCKS5 出站。")
+        member = copy.deepcopy(old)
+        member["tag"] = prefix + "1"
+        outbounds.append(member)
+        previous = old["tag"]
+        rule["outboundTag"] = member["tag"]
+        if outbound_tag == previous:
+            outbound_tag = member["tag"]
+        if not any(item.get("outboundTag") == previous for item in rules):
+            outbounds.remove(old)
+        members = [member]
+    selected = next((out for out in members if out["tag"] == outbound_tag), None)
+    if action == "add-outbounds":
+        if not nodes:
+            raise SystemExit("至少需要一个 SOCKS5 出站。")
+        add_outbounds(prefix)
+    elif action == "switch-outbound":
+        if not selected:
+            raise SystemExit("出站不属于该 VLESS。")
+        rule["outboundTag"] = selected["tag"]
+    elif action == "edit-outbound":
+        if not selected or len(nodes) != 1:
+            raise SystemExit("选择一个出站并输入一条新的 SOCKS5 链接。")
+        host, port, user, password = nodes[0].split("\x1f")
+        server = {"address": host, "port": int(port)}
+        if user:
+            server["users"] = [{"user": user, "pass": password}]
+        selected["settings"] = {"servers": [server]}
+    elif action == "delete-outbound":
+        if not selected:
+            raise SystemExit("出站不属于该 VLESS。")
+        if len(members) == 1:
+            raise SystemExit("不能删除最后一个出站。")
+        outbounds.remove(selected)
+        if rule["outboundTag"] == selected["tag"]:
+            rule["outboundTag"] = next(out["tag"] for out in members if out is not selected)
+    elif action == "edit-vless":
+        raw_port = os.environ["EDIT_PORT"]
+        if raw_port:
+            if not re.fullmatch(r"[0-9]{1,5}", raw_port) or not 1024 <= int(raw_port) <= 65535:
+                raise SystemExit("端口必须在 1024-65535 之间。")
+            port = int(raw_port)
+            if port != inbound["port"] and (port in used or any(item["port"] == port for item in inbounds)):
+                raise SystemExit("端口已被占用。")
+            inbound["port"] = port
+        name = os.environ["EDIT_NAME"]
+        if name:
+            if re.search(r'[\x00-\x1f\x7f]', name):
+                raise SystemExit("名称不能包含控制字符。")
+            inbound["_remark"] = name
+    else:
+        raise SystemExit("未知操作。")
 with open(os.environ["NEW_CONFIG_FILE"], "w") as file:
     json.dump(config, file, indent=2)
 PYEOF
@@ -265,19 +353,19 @@ validate_and_install_config() {
         echo "Xray 配置校验失败，原配置未修改。" >&2
         return 1
     fi
-    apply_config_permissions "$new_config"
+    apply_config_permissions "$new_config" || return 1
     if [[ -f "$CONFIG_FILE" ]]; then
         CONFIG_BACKUP="${CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S-%N)"
-        cp -a "$CONFIG_FILE" "$CONFIG_BACKUP"
-        chmod 600 "$CONFIG_BACKUP"
+        cp -a "$CONFIG_FILE" "$CONFIG_BACKUP" || return 1
+        chmod 600 "$CONFIG_BACKUP" || return 1
     fi
     mv -f "$new_config" "$CONFIG_FILE"
 }
 
 start_service() {
     local unit_tmp
-    unit_tmp=$(mktemp "${SERVICE_FILE}.XXXXXX")
-    cat > "$unit_tmp" <<EOF
+    unit_tmp=$(mktemp "${SERVICE_FILE}.XXXXXX") || return 1
+    cat > "$unit_tmp" <<EOF || return 1
 [Unit]
 Description=Xray VLESS to SOCKS5 relay
 After=network-online.target
@@ -293,10 +381,10 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$unit_tmp"
-    mv -f "$unit_tmp" "$SERVICE_FILE"
-    systemctl daemon-reload
-    systemctl enable xray-relay
+    chmod 644 "$unit_tmp" || return 1
+    mv -f "$unit_tmp" "$SERVICE_FILE" || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable xray-relay || return 1
     restart_with_rollback
 }
 
@@ -308,8 +396,8 @@ restart_with_rollback() {
         fi
     fi
     if [[ -n "$CONFIG_BACKUP" ]]; then
-        cp -a "$CONFIG_BACKUP" "$CONFIG_FILE"
-        apply_config_permissions "$CONFIG_FILE"
+        cp -a "$CONFIG_BACKUP" "$CONFIG_FILE" || return 1
+        apply_config_permissions "$CONFIG_FILE" || return 1
         if systemctl restart xray-relay; then
             sleep 2
             if systemctl is-active --quiet xray-relay; then
@@ -342,9 +430,9 @@ PYEOF
 }
 
 print_result() {
-    VPS_IP="$VPS_IP" PUBLIC_KEY="$PUBLIC_KEY" CLIENT_FP="$CLIENT_FP" \
+    VPS_IP="$VPS_IP" XRAY_BIN="$XRAY_BIN" CLIENT_FP="$CLIENT_FP" \
     python3 - "$CONFIG_FILE" "$INFO_FILE" <<'PYEOF'
-import json, os, sys
+import json, os, re, subprocess, sys
 from urllib.parse import urlencode, quote
 config = json.load(open(sys.argv[1]))
 host = os.environ["VPS_IP"]
@@ -353,34 +441,198 @@ if ":" in host:
 lines = []
 for index, inbound in enumerate(config["inbounds"], 1):
     reality = inbound["streamSettings"]["realitySettings"]
+    key = subprocess.run([os.environ["XRAY_BIN"], "x25519", "-i", reality["privateKey"]],
+                         capture_output=True, text=True, check=True)
+    public_key = re.search(r'^(?:Public\s*Key|Password[^:]*):\s*(\S+)', key.stdout, re.I | re.M)
+    if not public_key:
+        raise SystemExit("无法生成节点链接：Xray 未返回公钥。")
     query = urlencode({"encryption": "none", "flow": "xtls-rprx-vision", "security": "reality",
                        "sni": reality["serverNames"][0], "fp": os.environ["CLIENT_FP"],
-                       "pbk": os.environ["PUBLIC_KEY"], "sid": reality["shortIds"][0], "type": "tcp"})
+                       "pbk": public_key[1], "sid": reality["shortIds"][0], "type": "tcp"})
     uuid = inbound["settings"]["clients"][0]["id"]
-    lines.append(f"vless://{uuid}@{host}:{inbound['port']}?{query}#{quote(f'SOCKS5-{index}')}")
+    name = inbound.get("_remark", f"VLESS-{index}")
+    lines.append(f"vless://{uuid}@{host}:{inbound['port']}?{query}#{quote(name)}")
 with open(sys.argv[2], "w") as file:
     file.write("\n".join(lines) + "\n")
 os.chmod(sys.argv[2], 0o600)
-print("部署完成，节点链接：\n" + "\n\n".join(lines))
+print("节点链接：\n" + "\n\n".join(lines))
 print(f"链接已保存到 {sys.argv[2]}")
 print("请在云安全组及自定义防火墙中放行这些节点的 TCP 端口。")
 PYEOF
 }
 
+show_nodes() {
+    python3 - "$CONFIG_FILE" "${1:-}" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+for index, inbound in enumerate(config["inbounds"], 1):
+    tag = inbound["tag"]
+    if sys.argv[2] and tag != sys.argv[2]:
+        continue
+    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
+    members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
+    if not members:
+        members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
+    print(f"{index}) {inbound.get('_remark', tag)}  端口 {inbound['port']}")
+    for number, outbound in enumerate(members, 1):
+        server = outbound["settings"]["servers"][0]
+        current = " [当前]" if outbound["tag"] == rule["outboundTag"] else ""
+        print(f"   {number}) {server['address']}:{server['port']}{current}")
+PYEOF
+}
+
+select_entry() {
+    local number
+    show_nodes || return 1
+    prompt_read number -p "VLESS 编号: " || return 1
+    if [[ ! "$number" =~ ^[1-9][0-9]*$ ]]; then
+        echo "编号无效。" >&2
+        return 1
+    fi
+    SELECTED_ENTRY=$(python3 - "$CONFIG_FILE" "$number" <<'PYEOF'
+import json, sys
+inbounds = json.load(open(sys.argv[1]))["inbounds"]
+index = int(sys.argv[2]) - 1
+if index >= len(inbounds):
+    raise SystemExit("VLESS 编号无效。")
+print(inbounds[index]["tag"])
+PYEOF
+) || return 1
+}
+
+select_outbound() {
+    local number
+    show_nodes "$SELECTED_ENTRY" || return 1
+    prompt_read number -p "出站编号: " || return 1
+    if [[ ! "$number" =~ ^[1-9][0-9]*$ ]]; then
+        echo "编号无效。" >&2
+        return 1
+    fi
+    SELECTED_OUTBOUND=$(python3 - "$CONFIG_FILE" "$SELECTED_ENTRY" "$number" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+tag = sys.argv[2]
+members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
+if not members:
+    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
+    members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
+index = int(sys.argv[3]) - 1
+if index >= len(members):
+    raise SystemExit("出站编号无效。")
+print(members[index]["tag"])
+PYEOF
+) || return 1
+}
+
+apply_change() {
+    local action="$1"
+    NEW_CONFIG=$(mktemp --suffix=.json "${CONFIG_FILE}.new.XXXXXX") || return 1
+    if ! generate_config "$NEW_CONFIG" "$@" || ! validate_and_install_config "$NEW_CONFIG"; then
+        rm -f -- "$NEW_CONFIG"
+        return 1
+    fi
+    if [[ -f "$SERVICE_FILE" ]]; then
+        restart_with_rollback || return 1
+    else
+        start_service || return 1
+    fi
+    if [[ "$action" == add-vless || "$action" == edit-vless ]]; then
+        setup_firewall || return 1
+        print_result || return 1
+    fi
+    echo "配置已更新。"
+}
+
+manage_menu() {
+    local choice raw action
+    while true; do
+        echo
+        echo "1) 查看 VLESS 和出站"
+        echo "2) 新增 VLESS"
+        echo "3) 为 VLESS 添加 SOCKS5 出站"
+        echo "4) 切换当前出站"
+        echo "5) 编辑 SOCKS5 出站"
+        echo "6) 删除 SOCKS5 出站"
+        echo "7) 修改 VLESS 名称和端口"
+        echo "8) 查看节点链接"
+        echo "0) 退出"
+        prompt_read choice -p "选择: " || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) show_nodes ;;
+            2)
+                if collect_nodes && VPS_IP=$(get_ip) && generate_keys; then
+                    if ! apply_change add-vless; then echo "操作失败。" >&2; fi
+                fi
+                ;;
+            3|4|5|6|7)
+                select_entry || continue
+                case "$choice" in
+                    3)
+                        collect_nodes || continue
+                        action=add-outbounds
+                        SELECTED_OUTBOUND=""
+                        ;;
+                    4|5|6)
+                        if [[ "$choice" == 6 ]]; then
+                            echo "删除当前出口后将切换到第一个剩余出站；最后一个出站不能删除。"
+                        fi
+                        select_outbound || continue
+                        case "$choice" in
+                            4) action=switch-outbound ;;
+                            5)
+                                prompt_read raw -s -p "新的 SOCKS5 链接: " || continue
+                                echo
+                                if ! parse_socks5_raw "$raw"; then
+                                    echo "格式错误: $PARSE_ERROR" >&2
+                                    continue
+                                fi
+                                NODES=("${PARSED_HOST}"$'\x1f'"${PARSED_PORT}"$'\x1f'"${PARSED_USER}"$'\x1f'"${PARSED_PASS}")
+                                action=edit-outbound
+                                ;;
+                            6) action=delete-outbound ;;
+                        esac
+                        ;;
+                    7)
+                        prompt_read EDIT_NAME -p "新名称（回车保留）: " || continue
+                        prompt_read EDIT_PORT -p "新端口（回车保留）: " || continue
+                        VPS_IP=$(get_ip) || continue
+                        action=edit-vless
+                        SELECTED_OUTBOUND=""
+                        ;;
+                esac
+                if ! apply_change "$action" "$SELECTED_ENTRY" "$SELECTED_OUTBOUND"; then
+                    echo "操作失败。" >&2
+                fi
+                ;;
+            8)
+                if VPS_IP=$(get_ip); then print_result; fi
+                ;;
+            *) echo "选项无效。" >&2 ;;
+        esac
+    done
+}
+
 main() {
     preflight_check
+    trap '[[ -z "$NEW_CONFIG" ]] || rm -f -- "$NEW_CONFIG"' EXIT
+    if [[ -f "$CONFIG_FILE" ]]; then
+        install_xray
+        manage_menu
+        return
+    fi
     collect_nodes
     VPS_IP=$(get_ip)
     install_xray
     generate_keys
     install -d -m 755 "$(dirname "$CONFIG_FILE")"
-    NEW_CONFIG=$(mktemp "${CONFIG_FILE}.new.XXXXXX")
-    trap 'rm -f -- "$NEW_CONFIG"' EXIT
+    NEW_CONFIG=$(mktemp --suffix=.json "${CONFIG_FILE}.new.XXXXXX")
     generate_config "$NEW_CONFIG"
     validate_and_install_config "$NEW_CONFIG"
     start_service
     setup_firewall
     print_result
+    manage_menu
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
