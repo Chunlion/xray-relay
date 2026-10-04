@@ -109,6 +109,21 @@ socks5://[2001:db8::1]:1081
 EOF
 [[ ${#NODES[@]} == 2 ]]
 [[ -n "$PARSED_HOST" && "$PARSED_NODE" != *users* ]]
+(
+    START_PORT=""
+    generate_config "$TMP_DIR/random-first.json"
+    CONFIG_FILE="$TMP_DIR/random-first.json"
+    generate_config "$TMP_DIR/random-second.json"
+    python3 - "$CONFIG_FILE" "$TMP_DIR/random-second.json" <<'PYEOF'
+import json, sys
+first, second = (json.load(open(path)) for path in sys.argv[1:])
+ports = [node["port"] for node in second["inbounds"]]
+assert len(ports) == len(set(ports)) == 2
+assert all(10000 <= port <= 65535 and port not in (20000, 20002) for port in ports)
+assert second["inbounds"][0] == first["inbounds"][0]
+PYEOF
+)
+START_PORT=20000
 generate_config "$TMP_DIR/new.json"
 python3 - "$TMP_DIR/new.json" <<'PYEOF'
 import json, sys

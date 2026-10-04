@@ -11,7 +11,7 @@ SERVICE_LOG="/var/log/xray-relay.log"
 REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
 REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
 CLIENT_FP="${CLIENT_FP:-chrome}"
-START_PORT="${START_PORT:-20000}"
+START_PORT="${START_PORT:-}"
 XRAY_BIN=""
 CONFIG_BACKUP=""
 NEW_CONFIG=""
@@ -215,11 +215,13 @@ preflight_check() {
             return 1
         fi
     fi
-    if [[ ! "$START_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$START_PORT < 1024 || 10#$START_PORT > 65535 )); then
-        echo "START_PORT 必须在 1024-65535 之间。" >&2
-        return 1
+    if [[ -n "$START_PORT" ]]; then
+        if [[ ! "$START_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$START_PORT < 1024 || 10#$START_PORT > 65535 )); then
+            echo "START_PORT 必须在 1024-65535 之间。" >&2
+            return 1
+        fi
+        START_PORT=$((10#$START_PORT))
     fi
-    START_PORT=$((10#$START_PORT))
 }
 
 install_xray() {
@@ -371,11 +373,17 @@ if action in ("add-vless", "add-socks"):
     protocol = action[4:]
     if protocol == "socks":
         used.update(used_udp)
-    port = int(os.environ["START_PORT"])
-    while port in used:
-        port += 1
-    if port > 65535:
-        raise SystemExit("没有可用的监听端口。")
+    if protocol == "vless" and not os.environ["START_PORT"]:
+        available = [port for port in range(10000, 65536) if port not in used]
+        if not available:
+            raise SystemExit("没有可用的监听端口。")
+        port = secrets.choice(available)
+    else:
+        port = int(os.environ["START_PORT"] or "20000")
+        while port in used:
+            port += 1
+        if port > 65535:
+            raise SystemExit("没有可用的监听端口。")
     index = 1
     while any(inbound["tag"] == f"{protocol}-in-{index}" for inbound in inbounds):
         index += 1
@@ -799,7 +807,11 @@ deploy_inbound() {
         generate_keys || return 1
     fi
     (umask 022; install -d -m 755 "$(dirname "$CONFIG_FILE")") || return 1
-    echo "正在生成配置，从 ${START_PORT} 开始分配空闲端口..."
+    if [[ "$protocol" == vless && -z "$START_PORT" ]]; then
+        echo "正在生成配置，随机分配空闲端口..."
+    else
+        echo "正在生成配置，从 ${START_PORT:-20000} 开始分配空闲端口..."
+    fi
     apply_change "add-$protocol"
 }
 
