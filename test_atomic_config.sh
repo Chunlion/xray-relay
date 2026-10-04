@@ -108,7 +108,7 @@ socks5://[2001:db8::1]:1081
 
 EOF
 [[ ${#NODES[@]} == 2 ]]
-[[ -n "$PARSED_HOST" && -z "$PARSED_USER" && -z "$PARSED_PASS" ]]
+[[ -n "$PARSED_HOST" && "$PARSED_NODE" != *users* ]]
 generate_config "$TMP_DIR/new.json"
 python3 - "$TMP_DIR/new.json" <<'PYEOF'
 import json, sys
@@ -153,7 +153,7 @@ if FAIL_DERIVE=1 print_result > "$TMP_DIR/derive-failed.out" 2>&1; then
     echo '派生失败不得报告成功' >&2; exit 1
 fi
 grep -q '公钥派生失败' "$TMP_DIR/derive-failed.out"
-if grep -Fq "$PRIVATE_KEY" "$TMP_DIR/derive-failed.out"; then
+if grep -Fq -- "$PRIVATE_KEY" "$TMP_DIR/derive-failed.out"; then
     echo '派生失败不得泄露私钥参数' >&2; exit 1
 fi
 cmp "$INFO_FILE" "$TMP_DIR/before-derive.links"
@@ -207,8 +207,8 @@ MODE=success RESTARTS=0
     grep -Fqx "ExecStart=\"$XRAY_BIN\" run -config \"$CONFIG_FILE\"" "$SERVICE_FILE"
 )
 cp "$INFO_FILE" "$TMP_DIR/original.links"
-parse_socks5_raw 'socks5://third.example:1082'
-NODES=("${PARSED_HOST}"$'\x1f'"${PARSED_PORT}"$'\x1f'"${PARSED_USER}"$'\x1f'"${PARSED_PASS}")
+parse_outbound_raw 'socks5://third.example:1082'
+NODES=("$PARSED_NODE")
 apply_change add-outbounds vless-in-1 > "$TMP_DIR/add.out"
 print_result > "$TMP_DIR/links.out"
 cmp "$INFO_FILE" "$TMP_DIR/original.links"
@@ -272,12 +272,12 @@ if apply_change switch-outbound vless-in-1 socks5-vless-in-2-1 > "$TMP_DIR/wrong
 fi
 cp "$CONFIG_FILE" "$TMP_DIR/before-port.json"
 EDIT_PORT=20002 EDIT_NAME='Renamed VLESS'
-if apply_change edit-vless vless-in-1 > "$TMP_DIR/occupied.out" 2>&1; then
+if apply_change edit-inbound vless-in-1 > "$TMP_DIR/occupied.out" 2>&1; then
     echo '不得使用占用端口' >&2; exit 1
 fi
 cmp "$CONFIG_FILE" "$TMP_DIR/before-port.json"
 EDIT_PORT=21000
-apply_change edit-vless vless-in-1 > "$TMP_DIR/port.out"
+apply_change edit-inbound vless-in-1 > "$TMP_DIR/port.out"
 python3 - "$CONFIG_FILE" "$TMP_DIR/before-port.json" <<'PYEOF'
 import json, sys
 current, original = (json.load(open(path)) for path in sys.argv[1:])
@@ -313,6 +313,150 @@ assert original["outbounds"][1] in current["outbounds"]
 assert current["routing"]["rules"][0]["outboundTag"] == "socks5-vless-in-1-1"
 assert len([out for out in current["outbounds"] if out["tag"].startswith("socks5-vless-in-1-")]) == 2
 PYEOF
+# SOCKS5 与 VLESS 共存，新增、切换和修改端口保留入站账号及其他入口。
+(
+    CONFIG_FILE="$TMP_DIR/socks.json"
+    cp "$TMP_DIR/two-vless.json" "$CONFIG_FILE"
+    INFO_FILE="$TMP_DIR/socks-links.txt"
+    VPS_IP=203.0.113.10 START_PORT=22000
+    ss() {
+        if [[ "$*" == *-lun* ]]; then
+            echo 'UNCONN 0 0 0.0.0.0:22000 0.0.0.0:*'
+        fi
+    }
+    apply_change add-socks > "$TMP_DIR/socks-add.out"
+    python3 - "$CONFIG_FILE" "$TMP_DIR/two-vless.json" "$INFO_FILE" <<'PYEOF'
+import json, sys
+from urllib.parse import urlsplit, unquote
+current, original = (json.load(open(path)) for path in sys.argv[1:3])
+assert current["inbounds"][:-1] == original["inbounds"]
+node = current["inbounds"][-1]
+assert node["protocol"] == "socks" and node["port"] == 22001
+assert "streamSettings" not in node
+assert node["settings"]["auth"] == "password" and node["settings"]["udp"] is True
+assert node["settings"]["ip"] == "203.0.113.10"
+account = node["settings"]["accounts"][0]
+assert account["user"] and len(account["pass"]) >= 24
+link = urlsplit(open(sys.argv[3]).read().splitlines()[-1])
+assert link.scheme == "socks5" and link.port == 22001
+assert unquote(link.username) == account["user"] and unquote(link.password) == account["pass"]
+assert current["routing"]["rules"][-1]["outboundTag"] == "socks5-socks-in-1-1"
+PYEOF
+    cp "$CONFIG_FILE" "$TMP_DIR/socks-before.json"
+    apply_change add-outbounds socks-in-1 > "$TMP_DIR/socks-append.out"
+    apply_change switch-outbound socks-in-1 socks5-socks-in-1-2 > "$TMP_DIR/socks-switch.out"
+    EDIT_PORT=22000
+    if apply_change edit-inbound socks-in-1 > "$TMP_DIR/socks-conflict.out" 2>&1; then
+        echo 'SOCKS5 不得占用已有 UDP 端口' >&2; exit 1
+    fi
+    EDIT_PORT=23000
+    apply_change edit-inbound socks-in-1 > "$TMP_DIR/socks-port.out"
+    python3 - "$CONFIG_FILE" "$TMP_DIR/socks-before.json" <<'PYEOF'
+import json, sys
+current, original = (json.load(open(path)) for path in sys.argv[1:])
+assert current["inbounds"][:-1] == original["inbounds"][:-1]
+assert current["inbounds"][-1]["settings"] == original["inbounds"][-1]["settings"]
+assert current["inbounds"][-1]["port"] == 23000
+assert current["routing"]["rules"][-1]["outboundTag"] == "socks5-socks-in-1-2"
+PYEOF
+    if [[ -n "$XRAY_TEST_BIN" ]]; then
+        python3 test_socks_relay.py "$XRAY_TEST_BIN" "$CONFIG_FILE"
+    fi
+    parse_outbound_raw 'vless://cb6b52d1-b85f-4e90-895a-c477e88a5139@127.0.0.1:443?type=tcp&security=none'
+    NODES=("$PARSED_NODE")
+    apply_change add-outbounds socks-in-1 > "$TMP_DIR/vless-out-add.out"
+    apply_change switch-outbound socks-in-1 socks5-socks-in-1-3 > "$TMP_DIR/vless-out-switch.out"
+    show_nodes > "$TMP_DIR/vless-out-list.out"
+    grep -q 'VLESS 127.0.0.1:443 \[当前\]' "$TMP_DIR/vless-out-list.out"
+    if [[ -n "$XRAY_TEST_BIN" ]]; then
+        python3 test_socks_relay.py "$XRAY_TEST_BIN" "$CONFIG_FILE"
+    fi
+    test_reality_key="$PUBLIC_KEY"
+    [[ ${#test_reality_key} == 43 ]] || test_reality_key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    for query in \
+        "type=tcp&security=reality&flow=xtls-rprx-vision&sni=www.cloudflare.com&pbk=$test_reality_key&sid=0123" \
+        'type=ws&security=tls&host=cdn.example&path=%2Frelay' \
+        'type=grpc&security=tls&serviceName=relay' \
+        'type=httpupgrade&security=tls&path=%2Frelay' \
+        'type=xhttp&security=tls&mode=stream-up&path=%2Frelay'; do
+        parse_outbound_raw "vless://cb6b52d1-b85f-4e90-895a-c477e88a5139@proxy.example:443?$query"
+        NODES=("$PARSED_NODE")
+        apply_change edit-outbound socks-in-1 socks5-socks-in-1-3 > "$TMP_DIR/vless-out-edit.out"
+    done
+    parse_outbound_raw 'socks5://restored.example:1080'
+    NODES=("$PARSED_NODE")
+    apply_change edit-outbound socks-in-1 socks5-socks-in-1-3 > "$TMP_DIR/socks-out-restored.out"
+    python3 - "$CONFIG_FILE" "$TMP_DIR/socks-before.json" <<'PYEOF'
+import json, sys
+current, original = (json.load(open(path)) for path in sys.argv[1:])
+outbound = next(out for out in current["outbounds"] if out["tag"] == "socks5-socks-in-1-3")
+assert outbound["protocol"] == "socks" and "streamSettings" not in outbound
+assert current["routing"]["rules"][-1]["outboundTag"] == outbound["tag"]
+assert current["inbounds"][-1]["settings"] == original["inbounds"][-1]["settings"]
+assert current["inbounds"][:-1] == original["inbounds"][:-1]
+PYEOF
+)
+# OpenRC 使用独立服务，覆盖依赖安装、核心复用、启动和失败回滚。
+(
+    rc-service() {
+        printf 'rc-service %s\n' "$*" >> "$CALLS"
+        [[ "$1" == xray-relay ]]
+        case "$2" in
+            restart)
+                RESTARTS=$((RESTARTS + 1))
+                [[ "$MODE" != failed && ( "$MODE" != rollback || "$RESTARTS" -gt 1 ) ]]
+                ;;
+            status) [[ "$MODE" != failed ]] ;;
+            stop) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    rc-update() { printf 'rc-update %s\n' "$*" >> "$CALLS"; }
+    apk() { printf 'apk %s\n' "$*" >> "$CALLS"; }
+    command() {
+        if [[ "$*" == '-v systemctl' || "$*" == '-v python3' ]]; then return 1; fi
+        builtin command "$@"
+    }
+    preflight_check
+    [[ "$SERVICE_MANAGER" == openrc && "$SERVICE_FILE" == /etc/init.d/xray-relay ]]
+    grep -Fxq 'apk add --no-cache curl python3 iproute2 unzip ca-certificates' "$CALLS"
+    SERVICE_FILE="$TMP_DIR/openrc-relay"
+    SERVICE_LOG="$TMP_DIR/openrc.log"
+    CONFIG_FILE="$TMP_DIR/openrc.json"
+    cp "$TMP_DIR/socks.json" "$CONFIG_FILE"
+    MODE=success RESTARTS=0
+    start_service > "$TMP_DIR/openrc-start.out"
+    sh -n "$SERVICE_FILE"
+    [[ $(stat -c %a "$SERVICE_FILE") == 755 ]]
+    grep -Fxq 'rc-update add xray-relay default' "$CALLS"
+    grep -Fxq 'command_background=true' "$SERVICE_FILE"
+    grep -Fxq 'pidfile="/run/xray-relay.pid"' "$SERVICE_FILE"
+    install_xray > "$TMP_DIR/openrc-detection.out"
+    [[ "$XRAY_BIN" == "$TMP_DIR/xray" ]]
+    CONFIG_BACKUP="$TMP_DIR/openrc-backup.json"
+    cp "$CONFIG_FILE" "$CONFIG_BACKUP"
+    printf '%s\n' '{"pass":"openrc-test-secret"}' > "$CONFIG_FILE"
+    printf '%s\n' 'startup failed: openrc-test-secret' > "$SERVICE_LOG"
+    MODE=rollback RESTARTS=0
+    if restart_with_rollback > "$TMP_DIR/openrc-rollback.out" 2>&1; then
+        echo 'OpenRC 回滚后不得报告部署成功' >&2; exit 1
+    fi
+    cmp "$CONFIG_FILE" "$CONFIG_BACKUP"
+    [[ "$RESTARTS" == 2 ]]
+    grep -q 'startup failed:' "$TMP_DIR/openrc-rollback.out"
+    if grep -q 'openrc-test-secret' "$TMP_DIR/openrc-rollback.out"; then
+        echo 'OpenRC 日志不得泄露凭据' >&2; exit 1
+    fi
+    CONFIG_BACKUP="" MODE=failed RESTARTS=0
+    printf '%s\n' '{"pass":"openrc-test-secret"}' > "$CONFIG_FILE"
+    if restart_with_rollback > "$TMP_DIR/openrc-first-failed.out" 2>&1; then
+        echo 'OpenRC 首次启动失败不得报告成功' >&2; exit 1
+    fi
+    [[ ! -f "$CONFIG_FILE" ]]
+    grep -Fxq 'rc-service xray-relay stop' "$CALLS"
+    grep -Fxq 'rc-update del xray-relay default' "$CALLS"
+)
+echo 'PASS: Alpine 依赖安装、OpenRC 服务生成、核心复用和启动失败回滚（模拟）'
 VPS_IP=2001:db8::10
 generate_config "$TMP_DIR/ipv6.json"
 python3 - "$TMP_DIR/ipv6.json" <<'PYEOF'
@@ -359,11 +503,11 @@ socks5://proxy.example:1080
 0
 EOF
 ) > "$TMP_DIR/first.out" 2>&1
-grep -q '1) 部署 VLESS + SOCKS5' "$TMP_DIR/first.out"
+grep -q '1) 创建 VLESS 入站' "$TMP_DIR/first.out"
 grep -q 'mock configuration rejected' "$TMP_DIR/first.out"
 grep -q '部署失败。' "$TMP_DIR/first.out"
 grep -q '配置校验通过。' "$TMP_DIR/first.out"
-grep -q '3) 为 VLESS 添加 SOCKS5 出站' "$TMP_DIR/first.out"
+grep -q '3) 为入站添加出站' "$TMP_DIR/first.out"
 if grep -Eq 'diagnostic-(user|password|id|private)' "$TMP_DIR/first.out"; then
     echo '首次部署错误提示不得泄露凭据' >&2; exit 1
 fi

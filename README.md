@@ -1,28 +1,39 @@
 # xray-relay
 
-VLESS + REALITY 入口 → SOCKS5 出站。一个 VLESS 可绑定多个 SOCKS5，手动选择当前出口。
+VLESS + REALITY 或 SOCKS5 入站 → SOCKS5 或 VLESS 出站。一个入口可混合绑定多个出站，手动选择当前出口。客户端需使用对应代理协议接入，暂不提供 Realm 式任意 TCP/UDP 端口透传。
 
 ## 使用
 
-在使用 systemd 的 Linux VPS 上，以 root 执行：
+支持使用 systemd 的 Linux VPS，以及使用 OpenRC 的 Alpine。以 root 执行；Alpine 首次使用先安装 Bash 和 curl：
+
+```sh
+apk add --no-cache bash curl ca-certificates
+```
+
+下载并运行（两种系统相同）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Chunlion/xray-relay/main/xray_deploy.sh -o xray_deploy.sh
 bash xray_deploy.sh
 ```
 
-首次运行显示部署菜单，选择 `1` 创建一个 VLESS。逐行粘贴它的 SOCKS5 出站链接，全部输入后按空回车结束；第一条作为当前出口。输入隐藏，支持：
+首次运行选择 `1` 创建 VLESS，或选择 `2` 创建 SOCKS5 入站。逐行粘贴 SOCKS5 或 VLESS 出站链接，全部输入后按空回车结束；第一条作为当前出口。输入隐藏，支持：
 
 ```text
 socks5://user:password@host:1080
 socks5://host:1080
 socks5://user:password@[2001:db8::1]:1080
 host:1080:user:password
+vless://UUID@host:443?encryption=none&security=tls&type=tcp&sni=example.com
 ```
 
 用户名或密码中的特殊字符须进行 URL 编码，例如 `@` 写成 `%40`、`:` 写成 `%3A`。UDP 转发需要 SOCKS5 服务支持 UDP ASSOCIATE。
 
-脚本自动生成 UUID、REALITY 密钥和节点链接，从 `20000` 开始分配空闲 TCP 端口。链接保存至 `/root/xray_nodes_info.txt`。活动的 UFW / firewalld 会自动放行；云安全组及自定义 nftables / iptables 需自行放行对应 TCP 端口。
+VLESS 出站支持 TCP/RAW、WS、gRPC、HTTPUpgrade 和基础 XHTTP，安全类型支持 none、TLS、REALITY，可导入本脚本生成的 VLESS 链接。目前仅支持 `encryption=none`，不支持 TCP HTTP 伪装及 XHTTP `extra` 等扩展参数；无法解析的参数会提示错误。传输方式也需要已有 Xray 核心支持。
+
+脚本自动生成 VLESS 的 UUID / REALITY 密钥，或 SOCKS5 的登录账号和密码，从 `20000` 开始分配空闲端口并生成节点链接。链接保存至 `/root/xray_nodes_info.txt`。活动的 UFW / firewalld 会自动放行；云安全组及自定义 nftables / iptables 需自行放行入站 TCP 端口，SOCKS5 入站还需放行同端口 UDP。
+
+SOCKS5 入站启用账号密码认证，生成 `socks5://账号:密码@地址:端口` 链接。SOCKS5 传输不加密。
 
 可修改起始端口或 REALITY 目标：
 
@@ -32,13 +43,13 @@ START_PORT=30000 REALITY_SERVER_NAME=www.apple.com bash xray_deploy.sh
 
 ## 与已有 Xray 共存
 
-优先复用已部署的 `xray-relay.service` 所用核心，再检测 233boy 的 `/etc/xray/bin/xray`、官方安装的 `/usr/local/bin/xray` 及 `xray.service` 使用的核心。未找到时，仅下载 Xray 核心至 `/usr/local/lib/xray-relay/xray`，自动下载支持 x86_64 / ARM64。更换核心路径后会同步更新中转服务。
+优先复用已部署的 `xray-relay` 所用核心，再检测 233boy 的 `/etc/xray/bin/xray`、官方安装的 `/usr/local/bin/xray`、`xray.service` 使用的核心及 Alpine 的 `/usr/bin/xray`。未找到时，仅下载 Xray 核心至 `/usr/local/lib/xray-relay/xray`，自动下载支持 x86_64 / ARM64。更换核心路径后会同步更新中转服务。
 
-使用独立的 `xray-relay.service` 和 `/usr/local/etc/xray-relay/config.json`，不修改或重启已有 `xray.service`，不占用已监听的端口。原脚本更新或卸载共享核心后，中转服务也需要该核心继续存在。
+使用独立的 `xray-relay` 服务和 `/usr/local/etc/xray-relay/config.json`，不修改或重启已有 Xray 服务，不占用已监听的端口。systemd 服务文件为 `/etc/systemd/system/xray-relay.service`，Alpine OpenRC 为 `/etc/init.d/xray-relay`，均设置开机启动。原脚本更新或卸载共享核心后，中转服务也需要该核心继续存在。
 
-部署完成后进入管理菜单；再次执行 `bash xray_deploy.sh` 也会进入菜单，保留已有节点。可新增 VLESS、向指定 VLESS 添加出站、切换当前出口、编辑或删除 SOCKS5，以及修改 VLESS 名称和端口。
+部署完成后进入管理菜单；再次执行 `bash xray_deploy.sh` 也会进入菜单，保留已有节点。选择 `2` 新增 VLESS，选择 `9` 新增 SOCKS5 入站。两种入口都可追加出站、切换当前出口、编辑或删除出站，以及修改入口名称和端口。编辑出站时可在 SOCKS5 与 VLESS 之间更换协议。
 
-新增出站保留 VLESS 的 UUID、密钥、端口及当前出口。备用出站需从菜单手动切换；删除当前出口会选择第一个剩余出站，最后一个出站不能删除。修改端口后需重新导入节点链接。
+新增出站保留原入口的账号、UUID、密钥、端口及当前出口。备用出站需从菜单手动切换；删除当前出口会选择第一个剩余出站，最后一个出站不能删除。修改端口后需重新导入节点链接。
 
 上一版的一对一配置仍可管理，编辑时只转换选中的 VLESS。每次修改先校验并备份原配置，启动失败尝试恢复本次备份。首次启动失败会停止并禁用中转服务、撤销本次配置，返回部署菜单。校验失败会显示核心路径、退出码和隐藏凭据后的具体错误。
 
@@ -48,10 +59,20 @@ systemctl restart xray-relay
 journalctl -u xray-relay -n 30
 ```
 
+Alpine 使用以下命令，日志保留本次启动后的内容：
+
+```sh
+rc-service xray-relay status
+rc-service xray-relay restart
+tail -n 30 /var/log/xray-relay.log
+```
+
 ## 检查
 
 ```bash
 bash run_all_tests.sh
 ```
 
-流程参考 [233boy/Xray](https://github.com/233boy/Xray)，配置使用 [Xray SOCKS 出站](https://xtls.github.io/en/config/outbounds/socks.html)。
+指定 `XRAY_TEST_BIN=/完整路径/xray` 可额外使用真实核心校验配置，并在回环地址测试 SOCKS5 入站到 SOCKS5 / VLESS 出站的 TCP/UDP 两跳转发与认证。
+
+流程参考 [233boy/Xray](https://github.com/233boy/Xray)，配置参考 [Xray SOCKS 出站](https://xtls.github.io/en/config/outbounds/socks.html)和 [VLESS 出站](https://xtls.github.io/en/config/outbounds/vless.html)。

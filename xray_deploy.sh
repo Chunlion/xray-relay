@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# VLESS + REALITY 入口，每个入口可绑定多个 SOCKS5 出站。
+# VLESS + REALITY 或 SOCKS5 入口，每个入口可绑定多个 SOCKS5 / VLESS 出站。
 set -euo pipefail
 umask 077
 
 CONFIG_FILE="/usr/local/etc/xray-relay/config.json"
 INFO_FILE="/root/xray_nodes_info.txt"
 SERVICE_FILE="/etc/systemd/system/xray-relay.service"
+SERVICE_MANAGER=systemd
+SERVICE_LOG="/var/log/xray-relay.log"
 REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
 REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
 CLIENT_FP="${CLIENT_FP:-chrome}"
@@ -24,16 +26,19 @@ prompt_read() {
     printf -v "$variable" '%s' "$value"
 }
 
-parse_socks5_raw() {
+parse_outbound_raw() {
     local raw="$1" out payload
-    PARSED_HOST="" PARSED_PORT="" PARSED_USER="" PARSED_PASS="" PARSE_ERROR=""
+    PARSED_HOST="" PARSED_PORT="" PARSED_NODE="" PARSE_ERROR=""
     out=$(INPUT="$raw" python3 - <<'PYEOF'
-import os, sys, re, ipaddress
-from urllib.parse import urlsplit, unquote
+import os, sys, re, ipaddress, json, uuid
+from urllib.parse import urlsplit, unquote, parse_qsl
 
 raw = os.environ["INPUT"].strip()
 def fail(message):
     print("ERR\t" + message)
+    sys.exit(0)
+def emit(host, port, node):
+    print("OK\t" + "\x1f".join([host, str(port), json.dumps(node, ensure_ascii=True)]))
     sys.exit(0)
 def ok(host, port, user, password):
     try:
@@ -56,11 +61,95 @@ def ok(host, port, user, password):
         fail("字段不能包含控制字符")
     if any(len(field.encode()) > 255 for field in fields[2:]):
         fail("用户名和密码不能超过 255 字节")
-    print("OK\t" + "\x1f".join(fields))
-    sys.exit(0)
+    server = {"address": host, "port": port}
+    if user:
+        server["users"] = [{"user": user, "pass": password}]
+    emit(host, port, {"protocol": "socks", "settings": {"servers": [server]}})
 
 if re.search(r'[\x00-\x1f\x7f]', raw):
     fail("链接不能包含控制字符")
+if raw.startswith("vless://"):
+    try:
+        url = urlsplit(raw)
+        host, port = url.hostname, url.port
+        identity = str(uuid.UUID(unquote(url.username or "")))
+        pairs = parse_qsl(url.query, keep_blank_values=True)
+    except ValueError:
+        fail("VLESS 地址、端口或 UUID 无效")
+    if not host or re.search(r'[\s/@?#\\%]', host) or not port or not 1 <= port <= 65535:
+        fail("VLESS 地址或端口无效")
+    if url.password is not None or url.path not in ("", "/"):
+        fail("VLESS 链接格式无效")
+    if re.search(r'%(?![0-9a-fA-F]{2})', raw):
+        fail("链接中的百分号编码无效")
+    if any(re.search(r'[\x00-\x1f\x7f]', key + value) for key, value in pairs):
+        fail("字段不能包含控制字符")
+    query = dict(pairs)
+    if len(query) != len(pairs):
+        fail("VLESS 参数不能重复")
+    allowed = {"type", "security", "encryption", "flow", "sni", "fp", "pbk", "sid", "spx",
+               "alpn", "allowInsecure", "host", "path", "serviceName", "mode", "authority", "headerType"}
+    if query.keys() - allowed:
+        fail("VLESS 链接包含尚不支持的参数")
+    network = query.get("type", "tcp")
+    if network == "raw":
+        network = "tcp"
+    security = query.get("security", "none")
+    if network not in ("tcp", "ws", "grpc", "httpupgrade", "xhttp"):
+        fail("VLESS 传输仅支持 TCP、WS、gRPC、HTTPUpgrade 和 XHTTP")
+    if security not in ("none", "tls", "reality"):
+        fail("VLESS 安全类型仅支持 none、tls 和 reality")
+    if query.get("encryption", "none") != "none":
+        fail("当前仅支持 encryption=none 的 VLESS 链接")
+    if query.get("headerType", "none") != "none":
+        fail("当前不支持 TCP HTTP 伪装")
+    flow = query.get("flow", "")
+    if flow not in ("", "xtls-rprx-vision", "xtls-rprx-vision-udp443"):
+        fail("不支持此 VLESS flow")
+    if flow and (network != "tcp" or security == "none"):
+        fail("Vision 需要 TCP + TLS 或 REALITY")
+    user = {"id": identity, "encryption": "none"}
+    if flow:
+        user["flow"] = flow
+    stream = {"network": network, "security": security}
+    if security == "reality":
+        key, sid = query.get("pbk", ""), query.get("sid", "")
+        if not re.fullmatch(r'[A-Za-z0-9_-]{43}', key):
+            fail("REALITY 需要有效的 pbk 公钥")
+        if not re.fullmatch(r'(?:[0-9a-fA-F]{2}){0,8}', sid):
+            fail("REALITY sid 必须是最多 16 位的偶数位十六进制字符串")
+        stream["realitySettings"] = {"serverName": query.get("sni", host),
+            "fingerprint": query.get("fp") or "chrome", "publicKey": key, "shortId": sid,
+            "spiderX": query.get("spx", "/")}
+    elif security == "tls":
+        tls = {"serverName": query.get("sni", host)}
+        if query.get("fp"):
+            tls["fingerprint"] = query["fp"]
+        if query.get("alpn"):
+            tls["alpn"] = query["alpn"].split(",")
+        if query.get("allowInsecure", "0") not in ("0", "1", "false", "true"):
+            fail("allowInsecure 必须是 0、1、false 或 true")
+        tls["allowInsecure"] = query.get("allowInsecure", "0") in ("1", "true")
+        stream["tlsSettings"] = tls
+    if network == "ws":
+        stream["wsSettings"] = {"path": query.get("path", "/")}
+        if query.get("host"):
+            stream["wsSettings"]["headers"] = {"Host": query["host"]}
+    elif network == "grpc":
+        if query.get("mode", "gun") not in ("gun", "multi"):
+            fail("gRPC mode 必须是 gun 或 multi")
+        stream["grpcSettings"] = {"serviceName": query.get("serviceName", ""),
+            "multiMode": query.get("mode") == "multi", "authority": query.get("authority", "")}
+    elif network in ("httpupgrade", "xhttp"):
+        settings = {"path": query.get("path", "/"), "host": query.get("host", "")}
+        if network == "xhttp":
+            mode = query.get("mode", "auto")
+            if mode not in ("auto", "packet-up", "stream-up", "stream-one"):
+                fail("XHTTP mode 无效")
+            settings["mode"] = mode
+        stream[network + "Settings"] = settings
+    emit(host, port, {"protocol": "vless", "settings": {"vnext": [
+        {"address": host, "port": port, "users": [user]}]}, "streamSettings": stream})
 if raw.startswith(("socks5://", "socks://")):
     try:
         url = urlsplit(raw)
@@ -80,12 +169,12 @@ if match:
 parts = raw.split(":")
 if len(parts) == 4:
     ok(*parts)
-fail("使用 socks5://用户名:密码@地址:端口 或 socks5://地址:端口")
+fail("使用 socks5://用户名:密码@地址:端口、socks5://地址:端口 或 vless:// 链接")
 PYEOF
 )
     if [[ "$out" == OK$'\t'* ]]; then
         payload="${out#*$'\t'}"
-        IFS=$'\x1f' read -r PARSED_HOST PARSED_PORT PARSED_USER PARSED_PASS <<< "$payload"
+        IFS=$'\x1f' read -r PARSED_HOST PARSED_PORT PARSED_NODE <<< "$payload"
         return 0
     fi
     PARSE_ERROR="${out#*$'\t'}"
@@ -93,8 +182,17 @@ PYEOF
 }
 
 preflight_check() {
-    if [[ $(id -u) != 0 || ! -d /run/systemd/system ]]; then
-        echo "需要在使用 systemd 的 Linux VPS 上以 root 运行。" >&2
+    if [[ $(id -u) != 0 ]]; then
+        echo "需要以 root 运行。" >&2
+        return 1
+    fi
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
+        SERVICE_MANAGER=systemd
+    elif command -v rc-service >/dev/null && command -v rc-update >/dev/null; then
+        SERVICE_MANAGER=openrc
+        SERVICE_FILE=/etc/init.d/xray-relay
+    else
+        echo "需要使用 systemd 或 OpenRC 的 Linux VPS。" >&2
         return 1
     fi
     local missing=0 cmd
@@ -102,7 +200,9 @@ preflight_check() {
         command -v "$cmd" >/dev/null || missing=1
     done
     if (( missing )); then
-        if command -v apt-get >/dev/null; then
+        if command -v apk >/dev/null; then
+            apk add --no-cache curl python3 iproute2 unzip ca-certificates || return 1
+        elif command -v apt-get >/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y --no-install-recommends curl python3 iproute2 unzip ca-certificates
@@ -124,15 +224,21 @@ preflight_check() {
 
 install_xray() {
     local candidate service_start service_bin="" relay_bin="" arch work
-    service_start=$(systemctl show -p ExecStart --value xray-relay 2>/dev/null || true)
-    if [[ "$service_start" =~ path=([^[:space:]\;]+) ]]; then
-        relay_bin="${BASH_REMATCH[1]}"
+    if [[ "$SERVICE_MANAGER" == openrc ]]; then
+        if [[ -f "$SERVICE_FILE" ]]; then
+            relay_bin=$(sed -n 's/^command="\([^"]*\)"$/\1/p' "$SERVICE_FILE")
+        fi
+    else
+        service_start=$(systemctl show -p ExecStart --value xray-relay 2>/dev/null || true)
+        if [[ "$service_start" =~ path=([^[:space:]\;]+) ]]; then
+            relay_bin="${BASH_REMATCH[1]}"
+        fi
+        service_start=$(systemctl show -p ExecStart --value xray 2>/dev/null || true)
+        if [[ "$service_start" =~ path=([^[:space:]\;]+) ]]; then
+            service_bin="${BASH_REMATCH[1]}"
+        fi
     fi
-    service_start=$(systemctl show -p ExecStart --value xray 2>/dev/null || true)
-    if [[ "$service_start" =~ path=([^[:space:]\;]+) ]]; then
-        service_bin="${BASH_REMATCH[1]}"
-    fi
-    for candidate in "$relay_bin" /etc/xray/bin/xray /usr/local/bin/xray "$service_bin" /usr/local/lib/xray-relay/xray; do
+    for candidate in "$relay_bin" /etc/xray/bin/xray /usr/local/bin/xray "$service_bin" /usr/bin/xray /usr/local/lib/xray-relay/xray; do
         if [[ -x "$candidate" ]] && "$candidate" version 2>/dev/null | grep -q '^Xray '; then
             XRAY_BIN="$candidate"
             echo "复用 Xray 核心: $XRAY_BIN"
@@ -153,8 +259,8 @@ install_xray() {
         echo "下载 Xray 核心失败。" >&2
         return 1
     fi
-    if ! install -d -m 755 /usr/local/lib/xray-relay \
-        || ! install -m 755 "$work/xray" /usr/local/lib/xray-relay/xray; then
+    if ! (umask 022; install -d -m 755 /usr/local/lib/xray-relay \
+        && install -m 755 "$work/xray" /usr/local/lib/xray-relay/xray); then
         rm -rf -- "$work"
         echo "无法安装 Xray 核心，请检查目录权限和磁盘空间。" >&2
         return 1
@@ -186,23 +292,23 @@ get_ip() {
 collect_nodes() {
     local raw
     NODES=()
-    echo "逐行粘贴 SOCKS5 链接，输入隐藏；全部输入后按空回车结束。"
+    echo "逐行粘贴 SOCKS5 或 VLESS 出站链接，输入隐藏；全部输入后按空回车结束。"
     while true; do
-        if ! prompt_read raw -s -p "SOCKS5 [$(( ${#NODES[@]} + 1 ))]: "; then
+        if ! prompt_read raw -s -p "出站 [$(( ${#NODES[@]} + 1 ))]: "; then
             echo
             break
         fi
         echo
         [[ -n "$raw" ]] || break
-        if parse_socks5_raw "$raw"; then
-            NODES+=("${PARSED_HOST}"$'\x1f'"${PARSED_PORT}"$'\x1f'"${PARSED_USER}"$'\x1f'"${PARSED_PASS}")
+        if parse_outbound_raw "$raw"; then
+            NODES+=("$PARSED_NODE")
             echo "已添加出站 ${#NODES[@]}: ${PARSED_HOST}:${PARSED_PORT}"
         else
             echo "格式错误: $PARSE_ERROR" >&2
         fi
     done
     if (( ${#NODES[@]} == 0 )); then
-        echo "未输入 SOCKS5，操作取消。" >&2
+        echo "未输入出站，操作取消。" >&2
         return 1
     fi
 }
@@ -221,15 +327,16 @@ generate_keys() {
 }
 
 generate_config() {
-    local target="$1" action="${2:-add-vless}" entry="${3:-}" outbound="${4:-}" occupied
+    local target="$1" action="${2:-add-vless}" entry="${3:-}" outbound="${4:-}" occupied occupied_udp
     occupied=$(ss -H -ltn) || return 1
+    occupied_udp=$(ss -H -lun) || return 1
     CONFIG_FILE="$CONFIG_FILE" NEW_CONFIG_FILE="$target" ACTION="$action" ENTRY_TAG="$entry" \
     OUTBOUND_TAG="$outbound" EDIT_PORT="${EDIT_PORT:-}" EDIT_NAME="${EDIT_NAME:-}" \
     VPS_IP="${VPS_IP:-}" UUID="${UUID:-}" PRIVATE_KEY="${PRIVATE_KEY:-}" SHORT_ID="${SHORT_ID:-}" \
-    START_PORT="$START_PORT" OCCUPIED="$occupied" REALITY_DEST="$REALITY_DEST" \
+    START_PORT="$START_PORT" OCCUPIED="$occupied" UDP_OCCUPIED="$occupied_udp" REALITY_DEST="$REALITY_DEST" \
     REALITY_SERVER_NAME="$REALITY_SERVER_NAME" NODES_DATA="$(printf '%s\n' "${NODES[@]}")" \
     python3 - <<'PYEOF'
-import copy, json, os, re
+import copy, json, os, re, secrets
 source = os.environ["CONFIG_FILE"]
 if os.path.isfile(source):
     with open(source) as file:
@@ -239,38 +346,40 @@ else:
               "routing": {"domainStrategy": "AsIs", "rules": []}}
 inbounds, outbounds, rules = config["inbounds"], config["outbounds"], config["routing"]["rules"]
 action, entry_tag, outbound_tag = (os.environ[key] for key in ("ACTION", "ENTRY_TAG", "OUTBOUND_TAG"))
-nodes = [node for node in os.environ["NODES_DATA"].splitlines() if node]
+nodes = [json.loads(node) for node in os.environ["NODES_DATA"].splitlines() if node]
 used = {int(line.split()[3].rsplit(":", 1)[1])
         for line in os.environ["OCCUPIED"].splitlines() if line.strip()}
+used_udp = {int(line.split()[3].rsplit(":", 1)[1])
+            for line in os.environ["UDP_OCCUPIED"].splitlines() if line.strip()}
 
 def add_outbounds(prefix):
     added = []
     for node in nodes:
-        host, port, user, password = node.split("\x1f")
         index = 1
         while any(out["tag"] == f"{prefix}{index}" for out in outbounds):
             index += 1
-        server = {"address": host, "port": int(port)}
-        if user:
-            server["users"] = [{"user": user, "pass": password}]
-        out = {"tag": f"{prefix}{index}", "protocol": "socks", "settings": {"servers": [server]}}
+        out = copy.deepcopy(node)
+        out["tag"] = f"{prefix}{index}"
         outbounds.append(out)
         added.append(out)
     return added
 
-if action == "add-vless":
+if action in ("add-vless", "add-socks"):
     if not nodes:
-        raise SystemExit("至少需要一个 SOCKS5 出站。")
+        raise SystemExit("至少需要一个出站。")
     used.update(inbound["port"] for inbound in inbounds)
+    protocol = action[4:]
+    if protocol == "socks":
+        used.update(used_udp)
     port = int(os.environ["START_PORT"])
     while port in used:
         port += 1
     if port > 65535:
         raise SystemExit("没有可用的监听端口。")
     index = 1
-    while any(inbound["tag"] == f"vless-in-{index}" for inbound in inbounds):
+    while any(inbound["tag"] == f"{protocol}-in-{index}" for inbound in inbounds):
         index += 1
-    entry_tag = f"vless-in-{index}"
+    entry_tag = f"{protocol}-in-{index}"
     inbound = {
         "tag": entry_tag, "_remark": f"VLESS-{index}",
         "listen": "::" if ":" in os.environ["VPS_IP"] else "0.0.0.0", "port": port, "protocol": "vless",
@@ -279,6 +388,12 @@ if action == "add-vless":
             "dest": os.environ["REALITY_DEST"], "serverNames": [os.environ["REALITY_SERVER_NAME"]],
             "privateKey": os.environ["PRIVATE_KEY"], "shortIds": [os.environ["SHORT_ID"]]}}
     }
+    if protocol == "socks":
+        inbound.update({"_remark": f"SOCKS5-{index}", "protocol": "socks", "settings": {
+            "auth": "password", "accounts": [{"user": "relay_" + secrets.token_hex(4),
+                                                "pass": secrets.token_urlsafe(24)}],
+            "udp": True, "ip": os.environ["VPS_IP"]}})
+        del inbound["streamSettings"]
     inbounds.append(inbound)
     added = add_outbounds(f"socks5-{entry_tag}-")
     rules.append({"type": "field", "inboundTag": [entry_tag], "outboundTag": added[0]["tag"]})
@@ -286,14 +401,14 @@ else:
     inbound = next((item for item in inbounds if item["tag"] == entry_tag), None)
     rule = next((item for item in rules if item.get("inboundTag") == [entry_tag]), None)
     if not inbound or not rule:
-        raise SystemExit("VLESS 或对应路由不存在。")
+        raise SystemExit("入站或对应路由不存在。")
     prefix = f"socks5-{entry_tag}-"
     members = [out for out in outbounds if out["tag"].startswith(prefix)]
     # 将上一版一对一的出站纳入该入口，保持其他入口的路由不变。
     if not members:
         old = next((out for out in outbounds if out["tag"] == rule.get("outboundTag")), None)
         if not old or old["protocol"] != "socks":
-            raise SystemExit("找不到该 VLESS 的 SOCKS5 出站。")
+            raise SystemExit("找不到该入口的 SOCKS5 出站。")
         member = copy.deepcopy(old)
         member["tag"] = prefix + "1"
         outbounds.append(member)
@@ -307,29 +422,29 @@ else:
     selected = next((out for out in members if out["tag"] == outbound_tag), None)
     if action == "add-outbounds":
         if not nodes:
-            raise SystemExit("至少需要一个 SOCKS5 出站。")
+            raise SystemExit("至少需要一个出站。")
         add_outbounds(prefix)
     elif action == "switch-outbound":
         if not selected:
-            raise SystemExit("出站不属于该 VLESS。")
+            raise SystemExit("出站不属于该入口。")
         rule["outboundTag"] = selected["tag"]
     elif action == "edit-outbound":
         if not selected or len(nodes) != 1:
-            raise SystemExit("选择一个出站并输入一条新的 SOCKS5 链接。")
-        host, port, user, password = nodes[0].split("\x1f")
-        server = {"address": host, "port": int(port)}
-        if user:
-            server["users"] = [{"user": user, "pass": password}]
-        selected["settings"] = {"servers": [server]}
+            raise SystemExit("选择一个出站并输入一条新的 SOCKS5 或 VLESS 链接。")
+        tag = selected["tag"]
+        selected.clear()
+        selected.update(copy.deepcopy(nodes[0]), tag=tag)
     elif action == "delete-outbound":
         if not selected:
-            raise SystemExit("出站不属于该 VLESS。")
+            raise SystemExit("出站不属于该入口。")
         if len(members) == 1:
             raise SystemExit("不能删除最后一个出站。")
         outbounds.remove(selected)
         if rule["outboundTag"] == selected["tag"]:
             rule["outboundTag"] = next(out["tag"] for out in members if out is not selected)
-    elif action == "edit-vless":
+    elif action == "edit-inbound":
+        if inbound["protocol"] == "socks":
+            used.update(used_udp)
         raw_port = os.environ["EDIT_PORT"]
         if raw_port:
             if not re.fullmatch(r"[0-9]{1,5}", raw_port) or not 1024 <= int(raw_port) <= 65535:
@@ -391,7 +506,7 @@ validate_and_install_config() {
     local new_config="$1" output status
     CONFIG_BACKUP=""
     echo "正在校验 Xray 配置..."
-    if output=$("$XRAY_BIN" run -test -config "$new_config" 2>&1); then
+    if output=$("$XRAY_BIN" run -test -config "$new_config" -format json 2>&1); then
         echo "配置校验通过。"
     else
         status=$?
@@ -402,19 +517,58 @@ validate_and_install_config() {
     fi
     apply_config_permissions "$new_config" || return 1
     if [[ -f "$CONFIG_FILE" ]]; then
-        CONFIG_BACKUP="${CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S-%N)"
+        CONFIG_BACKUP=$(mktemp "${CONFIG_FILE}.bak.XXXXXX") || return 1
         cp -a "$CONFIG_FILE" "$CONFIG_BACKUP" || return 1
         chmod 600 "$CONFIG_BACKUP" || return 1
     fi
     mv -f "$new_config" "$CONFIG_FILE"
 }
 
+service_control() {
+    if [[ "$SERVICE_MANAGER" == openrc ]]; then
+        case "$1" in
+            enable) rc-update add xray-relay default ;;
+            disable) rc-update del xray-relay default ;;
+            is-active) rc-service xray-relay status >/dev/null 2>&1 ;;
+            *) rc-service xray-relay "$1" ;;
+        esac
+    elif [[ "$1" == is-active ]]; then
+        systemctl is-active --quiet xray-relay
+    else
+        systemctl "$1" xray-relay
+    fi
+}
+
 start_service() {
-    local unit_tmp
+    local unit_tmp group
     unit_tmp=$(mktemp "${SERVICE_FILE}.XXXXXX") || return 1
-    cat > "$unit_tmp" <<EOF || return 1
+    if [[ "$SERVICE_MANAGER" == openrc ]]; then
+        group=$(id -gn nobody) || return 1
+        cat > "$unit_tmp" <<EOF || return 1
+#!/sbin/openrc-run
+description="Xray VLESS / SOCKS5 relay"
+command="$XRAY_BIN"
+command_args="run -config \"$CONFIG_FILE\""
+command_user="nobody:$group"
+command_background=true
+pidfile="/run/xray-relay.pid"
+output_log="$SERVICE_LOG"
+error_log="$SERVICE_LOG"
+
+depend() {
+    need net
+}
+
+start_pre() {
+    checkpath --file --owner "\$command_user" --mode 0640 "\$output_log" || return 1
+    : > "\$output_log"
+}
+EOF
+        chmod 755 "$unit_tmp" || return 1
+    else
+        cat > "$unit_tmp" <<EOF || return 1
 [Unit]
-Description=Xray VLESS to SOCKS5 relay
+Description=Xray VLESS / SOCKS5 relay
 After=network-online.target
 Wants=network-online.target
 
@@ -428,44 +582,53 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$unit_tmp" || return 1
+        chmod 644 "$unit_tmp" || return 1
+    fi
     mv -f "$unit_tmp" "$SERVICE_FILE" || return 1
-    systemctl daemon-reload || return 1
-    systemctl enable xray-relay || return 1
+    if [[ "$SERVICE_MANAGER" == systemd ]]; then
+        systemctl daemon-reload || return 1
+    fi
+    service_control enable || return 1
     restart_with_rollback
 }
 
 restart_with_rollback() {
-    local since output
+    local since output log_hint
     since=$(date +%s)
     echo "正在启动 xray-relay 服务..."
-    if systemctl restart xray-relay; then
+    if service_control restart; then
         sleep 2
-        if systemctl is-active --quiet xray-relay; then
+        if service_control is-active; then
             echo "xray-relay 服务运行中。"
             return 0
         fi
     fi
     echo "xray-relay 启动失败，服务日志：" >&2
-    output=$(journalctl -u xray-relay --since "@$since" -n 15 --no-pager 2>&1 || true)
+    if [[ "$SERVICE_MANAGER" == openrc ]]; then
+        log_hint="$SERVICE_LOG"
+        output=$(tail -n 15 "$SERVICE_LOG" 2>&1 || true)
+    else
+        log_hint="journalctl -u xray-relay"
+        output=$(journalctl -u xray-relay --since "@$since" -n 15 --no-pager 2>&1 || true)
+    fi
     show_xray_error "$CONFIG_FILE" "$output"
     if [[ -n "$CONFIG_BACKUP" ]]; then
         cp -a "$CONFIG_BACKUP" "$CONFIG_FILE" || return 1
         apply_config_permissions "$CONFIG_FILE" || return 1
-        if systemctl restart xray-relay; then
+        if service_control restart; then
             sleep 2
-            if systemctl is-active --quiet xray-relay; then
+            if service_control is-active; then
                 echo "启动失败，已恢复原中转配置。" >&2
                 return 1
             fi
         fi
-        echo "已恢复原中转配置，但服务未恢复，请检查 journalctl -u xray-relay。" >&2
+        echo "已恢复原中转配置，但服务未恢复，请检查 $log_hint。" >&2
     else
-        if ! systemctl stop xray-relay; then
-            echo "启动失败，且无法停止 xray-relay，请检查 journalctl -u xray-relay。" >&2
+        if ! service_control stop; then
+            echo "启动失败，且无法停止 xray-relay，请检查 $log_hint。" >&2
             return 1
         fi
-        systemctl disable xray-relay || return 1
+        service_control disable || return 1
         rm -f -- "$CONFIG_FILE" || return 1
         echo "首次启动失败，已停止服务并撤销本次配置，可从部署菜单重试。" >&2
     fi
@@ -473,18 +636,20 @@ restart_with_rollback() {
 }
 
 setup_firewall() {
-    local port
-    while read -r port; do
+    local port protocol
+    while read -r port protocol; do
         if command -v ufw >/dev/null && LC_ALL=C ufw status | grep -q '^Status: active'; then
-            ufw allow "$port/tcp"
+            ufw allow "$port/$protocol" || return 1
         elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port="$port/tcp"
-            firewall-cmd --add-port="$port/tcp"
+            firewall-cmd --permanent --add-port="$port/$protocol" || return 1
+            firewall-cmd --add-port="$port/$protocol" || return 1
         fi
     done < <(python3 - "$CONFIG_FILE" <<'PYEOF'
 import json, sys
 for inbound in json.load(open(sys.argv[1]))["inbounds"]:
-    print(inbound["port"])
+    print(inbound["port"], "tcp")
+    if inbound["protocol"] == "socks" and inbound["settings"].get("udp"):
+        print(inbound["port"], "udp")
 PYEOF
 )
 }
@@ -500,6 +665,12 @@ if ":" in host:
     host = f"[{host}]"
 lines = []
 for index, inbound in enumerate(config["inbounds"], 1):
+    name = inbound.get("_remark", f"{inbound['protocol'].upper()}-{index}")
+    if inbound["protocol"] == "socks":
+        account = inbound["settings"]["accounts"][0]
+        user, password = (quote(account[key], safe="") for key in ("user", "pass"))
+        lines.append(f"socks5://{user}:{password}@{host}:{inbound['port']}#{quote(name)}")
+        continue
     reality = inbound["streamSettings"]["realitySettings"]
     try:
         key = subprocess.run([os.environ["XRAY_BIN"], "x25519", "-i", reality["privateKey"]],
@@ -515,7 +686,6 @@ for index, inbound in enumerate(config["inbounds"], 1):
                        "sni": reality["serverNames"][0], "fp": os.environ["CLIENT_FP"],
                        "pbk": public_key[1], "sid": reality["shortIds"][0], "type": "tcp"})
     uuid = inbound["settings"]["clients"][0]["id"]
-    name = inbound.get("_remark", f"VLESS-{index}")
     lines.append(f"vless://{uuid}@{host}:{inbound['port']}?{query}#{quote(name)}")
 with open(sys.argv[2], "w") as file:
     file.write("\n".join(lines) + "\n")
@@ -523,6 +693,8 @@ os.chmod(sys.argv[2], 0o600)
 print("节点链接：\n" + "\n\n".join(lines))
 print(f"链接已保存到 {sys.argv[2]}")
 print("请在云安全组及自定义防火墙中放行这些节点的 TCP 端口。")
+if any(inbound["protocol"] == "socks" for inbound in config["inbounds"]):
+    print("SOCKS5 节点还需放行同端口 UDP；UDP 转发需要上游出站支持。")
 PYEOF
 }
 
@@ -540,16 +712,17 @@ for index, inbound in enumerate(config["inbounds"], 1):
         members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
     print(f"{index}) {inbound.get('_remark', tag)}  端口 {inbound['port']}")
     for number, outbound in enumerate(members, 1):
-        server = outbound["settings"]["servers"][0]
+        protocol = outbound["protocol"]
+        server = outbound["settings"]["vnext" if protocol == "vless" else "servers"][0]
         current = " [当前]" if outbound["tag"] == rule["outboundTag"] else ""
-        print(f"   {number}) {server['address']}:{server['port']}{current}")
+        print(f"   {number}) {protocol.upper()} {server['address']}:{server['port']}{current}")
 PYEOF
 }
 
 select_entry() {
     local number
     show_nodes || return 1
-    prompt_read number -p "VLESS 编号: " || return 1
+    prompt_read number -p "入站编号: " || return 1
     if [[ ! "$number" =~ ^[1-9][0-9]*$ ]]; then
         echo "编号无效。" >&2
         return 1
@@ -559,7 +732,7 @@ import json, sys
 inbounds = json.load(open(sys.argv[1]))["inbounds"]
 index = int(sys.argv[2]) - 1
 if index >= len(inbounds):
-    raise SystemExit("VLESS 编号无效。")
+    raise SystemExit("入站编号无效。")
 print(inbounds[index]["tag"])
 PYEOF
 ) || return 1
@@ -591,57 +764,68 @@ PYEOF
 
 apply_change() {
     local action="$1"
-    NEW_CONFIG=$(mktemp --suffix=.json "${CONFIG_FILE}.new.XXXXXX") || return 1
+    NEW_CONFIG=$(mktemp "${CONFIG_FILE}.new.XXXXXX") || return 1
     if ! generate_config "$NEW_CONFIG" "$@" || ! validate_and_install_config "$NEW_CONFIG"; then
         rm -f -- "$NEW_CONFIG"
         return 1
     fi
-    if [[ -f "$SERVICE_FILE" ]] && grep -Fxq "ExecStart=\"$XRAY_BIN\" run -config \"$CONFIG_FILE\"" "$SERVICE_FILE"; then
+    if [[ "$SERVICE_MANAGER" == openrc ]]; then
+        start_service || return 1
+    elif [[ -f "$SERVICE_FILE" ]] && grep -Fxq "ExecStart=\"$XRAY_BIN\" run -config \"$CONFIG_FILE\"" "$SERVICE_FILE"; then
         restart_with_rollback || return 1
     else
         start_service || return 1
     fi
-    if [[ "$action" == add-vless || "$action" == edit-vless ]]; then
+    if [[ "$action" == add-vless || "$action" == add-socks || "$action" == edit-inbound ]]; then
         setup_firewall || return 1
         print_result || return 1
     fi
     echo "配置已更新。"
 }
 
-deploy_vless() {
-    echo "创建一个 VLESS，输入的多个 SOCKS5 将作为它的出站，第一条为当前出口。"
+deploy_inbound() {
+    local protocol="${1:-vless}"
+    echo "创建 ${protocol^^} 入站，可输入多个 SOCKS5 / VLESS 出站，第一条为当前出口。"
+    if [[ "$protocol" == socks ]]; then
+        echo "SOCKS5 自动生成账号和密码，传输不加密。"
+    fi
     collect_nodes || return 1
     echo "正在获取 VPS 公网 IP..."
     VPS_IP=$(get_ip) || return 1
     echo "正在检查 Xray 核心..."
     install_xray || return 1
-    echo "正在生成 VLESS UUID 和 REALITY 密钥..."
-    generate_keys || return 1
-    install -d -m 755 "$(dirname "$CONFIG_FILE")" || return 1
+    if [[ "$protocol" == vless ]]; then
+        echo "正在生成 VLESS UUID 和 REALITY 密钥..."
+        generate_keys || return 1
+    fi
+    (umask 022; install -d -m 755 "$(dirname "$CONFIG_FILE")") || return 1
     echo "正在生成配置，从 ${START_PORT} 开始分配空闲端口..."
-    apply_change add-vless
+    apply_change "add-$protocol"
 }
 
 manage_menu() {
     local choice raw action
     while true; do
         echo
-        echo "1) 查看 VLESS 和出站"
+        echo "1) 查看入站和出站"
         echo "2) 新增 VLESS"
-        echo "3) 为 VLESS 添加 SOCKS5 出站"
+        echo "3) 为入站添加出站（SOCKS5 / VLESS）"
         echo "4) 切换当前出站"
-        echo "5) 编辑 SOCKS5 出站"
-        echo "6) 删除 SOCKS5 出站"
-        echo "7) 修改 VLESS 名称和端口"
+        echo "5) 编辑出站"
+        echo "6) 删除出站"
+        echo "7) 修改入站名称和端口"
         echo "8) 查看节点链接"
+        echo "9) 新增 SOCKS5 入站"
         echo "0) 退出"
         prompt_read choice -p "选择: " || return 0
         case "$choice" in
             0) return 0 ;;
             1) show_nodes ;;
-            2)
-                if ! deploy_vless; then
-                    echo "新增 VLESS 失败，请根据以上错误修正后重试。" >&2
+            2|9)
+                action=vless
+                [[ "$choice" != 9 ]] || action=socks
+                if ! deploy_inbound "$action"; then
+                    echo "新增入站失败，请根据以上错误修正后重试。" >&2
                 fi
                 ;;
             3|4|5|6|7)
@@ -660,13 +844,13 @@ manage_menu() {
                         case "$choice" in
                             4) action=switch-outbound ;;
                             5)
-                                prompt_read raw -s -p "新的 SOCKS5 链接: " || continue
+                                prompt_read raw -s -p "新的 SOCKS5 / VLESS 链接: " || continue
                                 echo
-                                if ! parse_socks5_raw "$raw"; then
+                                if ! parse_outbound_raw "$raw"; then
                                     echo "格式错误: $PARSE_ERROR" >&2
                                     continue
                                 fi
-                                NODES=("${PARSED_HOST}"$'\x1f'"${PARSED_PORT}"$'\x1f'"${PARSED_USER}"$'\x1f'"${PARSED_PASS}")
+                                NODES=("$PARSED_NODE")
                                 action=edit-outbound
                                 ;;
                             6) action=delete-outbound ;;
@@ -676,7 +860,7 @@ manage_menu() {
                         prompt_read EDIT_NAME -p "新名称（回车保留）: " || continue
                         prompt_read EDIT_PORT -p "新端口（回车保留）: " || continue
                         VPS_IP=$(get_ip) || continue
-                        action=edit-vless
+                        action=edit-inbound
                         SELECTED_OUTBOUND=""
                         ;;
                 esac
@@ -696,7 +880,7 @@ main() {
     local choice
     preflight_check
     trap '[[ -z "$NEW_CONFIG" ]] || rm -f -- "$NEW_CONFIG"' EXIT
-    echo "Xray VLESS → SOCKS5"
+    echo "Xray VLESS / SOCKS5 → SOCKS5 / VLESS"
     while true; do
         if [[ -f "$CONFIG_FILE" ]]; then
             install_xray
@@ -705,17 +889,19 @@ main() {
             return
         fi
         echo
-        echo "1) 部署 VLESS + SOCKS5"
+        echo "1) 创建 VLESS 入站"
+        echo "2) 创建 SOCKS5 入站"
         echo "0) 退出"
         prompt_read choice -p "选择: " || return 0
         case "$choice" in
             0) return 0 ;;
-            1)
-                if deploy_vless; then
+            1|2)
+                if [[ "$choice" == 1 ]]; then choice=vless; else choice=socks; fi
+                if deploy_inbound "$choice"; then
                     manage_menu
                     return
                 fi
-                echo "部署失败。请根据以上错误修正后选择 1 重试，或选择 0 退出。" >&2
+                echo "部署失败。请根据以上错误修正后重新选择部署，或选择 0 退出。" >&2
                 ;;
             *) echo "选项无效。" >&2 ;;
         esac
