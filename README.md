@@ -4,18 +4,19 @@ VLESS + REALITY 或 SOCKS5 入站 → SOCKS5 或 VLESS 出站。一个入口可�
 
 ## 使用
 
-支持使用 systemd 的 Linux VPS，以及使用 OpenRC 的 Alpine。以 root 执行；Alpine 首次使用先安装 Bash 和 curl：
+支持使用 systemd 的 Linux VPS，以及使用 OpenRC 的 Alpine。以 root 执行，首次安装或更新只需一条命令，缺少 Bash 时会自动安装：
 
 ```sh
-apk add --no-cache bash curl ca-certificates
+wget -qO- https://raw.githubusercontent.com/Chunlion/xray-relay/main/install.sh | sh
 ```
 
-下载并运行（两种系统相同）：
+以后输入以下命令打开菜单：
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Chunlion/xray-relay/main/xray_deploy.sh -o xray_deploy.sh
-bash xray_deploy.sh
+```sh
+xrelay
 ```
+
+已有 curl 的系统也可用 `curl -fsSL https://raw.githubusercontent.com/Chunlion/xray-relay/main/install.sh | sh` 安装。
 
 首次运行选择 `1` 创建 VLESS，或选择 `2` 创建 SOCKS5 入站。逐行粘贴 SOCKS5 或 VLESS 出站链接，全部输入后按空回车结束；第一条作为当前出口。输入隐藏，支持：
 
@@ -38,7 +39,7 @@ SOCKS5 入站启用账号密码认证，生成 `socks5://账号:密码@地址:�
 可修改起始端口或 REALITY 目标：
 
 ```bash
-START_PORT=30000 REALITY_SERVER_NAME=www.apple.com bash xray_deploy.sh
+START_PORT=30000 REALITY_SERVER_NAME=www.apple.com xrelay
 ```
 
 ## 与已有 Xray 共存
@@ -47,7 +48,7 @@ START_PORT=30000 REALITY_SERVER_NAME=www.apple.com bash xray_deploy.sh
 
 使用独立的 `xray-relay` 服务和 `/usr/local/etc/xray-relay/config.json`，不修改或重启已有 Xray 服务，不占用已监听的端口。systemd 服务文件为 `/etc/systemd/system/xray-relay.service`，Alpine OpenRC 为 `/etc/init.d/xray-relay`，均设置开机启动。原脚本更新或卸载共享核心后，中转服务也需要该核心继续存在。
 
-部署完成后进入管理菜单；再次执行 `bash xray_deploy.sh` 也会进入菜单，保留已有节点。选择 `2` 新增 VLESS，选择 `9` 新增 SOCKS5 入站。两种入口都可追加出站、切换当前出口、编辑或删除出站，以及修改入口名称和端口。编辑出站时可在 SOCKS5 与 VLESS 之间更换协议。
+部署完成后进入管理菜单；再次执行 `xrelay` 也会进入菜单，保留已有节点。选择 `2` 新增 VLESS，选择 `9` 新增 SOCKS5 入站。两种入口都可追加出站、切换当前出口、编辑或删除出站，以及修改入口名称和端口。编辑出站时可在 SOCKS5 与 VLESS 之间更换协议。
 
 新增出站保留原入口的账号、UUID、密钥、端口及当前出口。备用出站需从菜单手动切换；删除当前出口会选择第一个剩余出站，最后一个出站不能删除。修改端口后需重新导入节点链接。
 
