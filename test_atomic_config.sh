@@ -257,8 +257,7 @@ socks5://fourth.example:1083
 1
 4
 socks5://edited.example:1084
-6
-1
+10
 3
 0
 EOF
@@ -282,6 +281,69 @@ PYEOF
 if apply_change delete-outbound vless-in-2 socks5-vless-in-2-1 > "$TMP_DIR/delete-last.out" 2>&1; then
     echo '不得删除最后一个出站' >&2; exit 1
 fi
+(
+    CONFIG_FILE="$TMP_DIR/delete-nodes.json"
+    INFO_FILE="$TMP_DIR/delete-node-links.txt"
+    CALLS="$TMP_DIR/delete-node.calls"
+    cp "$TMP_DIR/two-vless.json" "$CONFIG_FILE"
+    print_result > "$TMP_DIR/delete-links.out"
+    cp "$INFO_FILE" "$TMP_DIR/links-before-delete.txt"
+    manage_menu > "$TMP_DIR/delete-node-menu.out" <<'EOF'
+6
+0
+6
+1
+0
+EOF
+    python3 - "$CONFIG_FILE" "$TMP_DIR/two-vless.json" "$INFO_FILE" "$TMP_DIR/links-before-delete.txt" <<'PYEOF'
+import json, sys
+current, original = (json.load(open(path)) for path in sys.argv[1:3])
+assert current["inbounds"] == original["inbounds"][1:]
+assert current["routing"]["rules"] == original["routing"]["rules"][1:]
+assert current["outbounds"] == [out for out in original["outbounds"] if out["tag"].startswith("socks5-vless-in-2-")]
+assert open(sys.argv[3]).read().splitlines() == open(sys.argv[4]).read().splitlines()[1:]
+PYEOF
+    cp "$CONFIG_FILE" "$TMP_DIR/last-node.json"
+    (
+        service_control() { [[ "$1" != stop ]]; }
+        if apply_change delete-inbound vless-in-2 > "$TMP_DIR/delete-stop-failed.out" 2>&1; then
+            echo '停止失败不得报告删除成功' >&2; exit 1
+        fi
+        cmp "$CONFIG_FILE" "$TMP_DIR/last-node.json"
+    )
+    manage_menu > "$TMP_DIR/delete-final-menu.out" <<'EOF'
+6
+1
+0
+EOF
+    python3 - "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert config["inbounds"] == config["outbounds"] == config["routing"]["rules"] == []
+PYEOF
+    [[ ! -s "$INFO_FILE" ]]
+    grep -Fxq 'stop xray-relay' "$CALLS"
+    grep -Fxq 'disable xray-relay' "$CALLS"
+    apply_change add-vless > "$TMP_DIR/recreate-node.out"
+    grep -Fxq 'enable xray-relay' "$CALLS"
+    # 旧配置共享同一出站时，删除节点保留其他节点正在使用的出站。
+    python3 - "$TMP_DIR/two-vless.json" "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+config["outbounds"] = [config["outbounds"][0]]
+config["outbounds"][0]["tag"] = "socks5-out-1"
+for rule in config["routing"]["rules"]:
+    rule["outboundTag"] = "socks5-out-1"
+json.dump(config, open(sys.argv[2], "w"))
+PYEOF
+    apply_change delete-inbound vless-in-1 > "$TMP_DIR/delete-shared.out"
+    python3 - "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert len(config["inbounds"]) == len(config["outbounds"]) == 1
+assert config["outbounds"][0]["tag"] == config["routing"]["rules"][0]["outboundTag"] == "socks5-out-1"
+PYEOF
+)
 if apply_change switch-outbound vless-in-1 socks5-vless-in-2-1 > "$TMP_DIR/wrong-owner.out" 2>&1; then
     echo '不得选择其他 VLESS 的出站' >&2; exit 1
 fi

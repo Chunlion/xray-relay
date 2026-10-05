@@ -405,6 +405,20 @@ if action in ("add-vless", "add-socks"):
     inbounds.append(inbound)
     added = add_outbounds(f"socks5-{entry_tag}-")
     rules.append({"type": "field", "inboundTag": [entry_tag], "outboundTag": added[0]["tag"]})
+elif action == "delete-inbound":
+    inbound = next((item for item in inbounds if item["tag"] == entry_tag), None)
+    if not inbound:
+        raise SystemExit("节点不存在。")
+    candidates = {out["tag"] for out in outbounds if out["tag"].startswith(f"socks5-{entry_tag}-")}
+    for rule in rules[:]:
+        if entry_tag in rule.get("inboundTag", []):
+            candidates.add(rule.get("outboundTag"))
+            rule["inboundTag"].remove(entry_tag)
+            if not rule["inboundTag"]:
+                rules.remove(rule)
+    inbounds.remove(inbound)
+    referenced = {rule.get("outboundTag") for rule in rules}
+    outbounds[:] = [out for out in outbounds if out["tag"] not in candidates or out["tag"] in referenced]
 else:
     inbound = next((item for item in inbounds if item["tag"] == entry_tag), None)
     rule = next((item for item in rules if item.get("inboundTag") == [entry_tag]), None)
@@ -446,7 +460,7 @@ else:
         if not selected:
             raise SystemExit("出站不属于该入口。")
         if len(members) == 1:
-            raise SystemExit("不能删除最后一个出站。")
+            raise SystemExit("这是节点唯一的出站；删除整条节点请选择菜单 6。")
         outbounds.remove(selected)
         if rule["outboundTag"] == selected["tag"]:
             rule["outboundTag"] = next(out["tag"] for out in members if out is not selected)
@@ -707,9 +721,12 @@ PYEOF
 }
 
 show_nodes() {
-    python3 - "$CONFIG_FILE" "${1:-}" <<'PYEOF'
+    python3 - "$CONFIG_FILE" "${1:-}" "${2:-}" <<'PYEOF'
 import json, sys
 config = json.load(open(sys.argv[1]))
+if not config["inbounds"]:
+    print("暂无节点，请先新增 VLESS 或 SOCKS5 节点。")
+    sys.exit(1 if sys.argv[3] == "entries" else 0)
 for index, inbound in enumerate(config["inbounds"], 1):
     tag = inbound["tag"]
     if sys.argv[2] and tag != sys.argv[2]:
@@ -718,19 +735,22 @@ for index, inbound in enumerate(config["inbounds"], 1):
     members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
     if not members:
         members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
-    print(f"{index}) {inbound.get('_remark', tag)}  端口 {inbound['port']}")
+    print(f"节点 {index}) {inbound.get('_remark', tag)}  {inbound['protocol'].upper()} :{inbound['port']}  出站 {len(members)} 个")
+    if sys.argv[3] == "entries":
+        continue
     for number, outbound in enumerate(members, 1):
         protocol = outbound["protocol"]
         server = outbound["settings"]["vnext" if protocol == "vless" else "servers"][0]
         current = " [当前]" if outbound["tag"] == rule["outboundTag"] else ""
-        print(f"   {number}) {protocol.upper()} {server['address']}:{server['port']}{current}")
+        print(f"   出站 {number}) {protocol.upper()} {server['address']}:{server['port']}{current}")
 PYEOF
 }
 
 select_entry() {
     local number
-    show_nodes || return 1
-    prompt_read number -p "入站编号: " || return 1
+    show_nodes "" entries || return 1
+    prompt_read number -p "${1:-节点编号（0 返回）}: " || return 1
+    [[ -n "$number" && "$number" != 0 ]] || return 1
     if [[ ! "$number" =~ ^[1-9][0-9]*$ ]]; then
         echo "编号无效。" >&2
         return 1
@@ -747,27 +767,49 @@ PYEOF
 }
 
 select_outbound() {
-    local number
-    show_nodes "$SELECTED_ENTRY" || return 1
-    prompt_read number -p "出站编号: " || return 1
+    local number row label index=0 choices
+    local -a items=()
+    choices=$(python3 - "$CONFIG_FILE" "${SELECTED_ENTRY:-}" "${1:-}" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+for inbound in config["inbounds"]:
+    tag = inbound["tag"]
+    if sys.argv[2] and tag != sys.argv[2]:
+        continue
+    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
+    members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
+    if not members:
+        members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
+    if sys.argv[3] == "delete" and len(members) == 1:
+        continue
+    for out in members:
+        protocol = out["protocol"]
+        server = out["settings"]["vnext" if protocol == "vless" else "servers"][0]
+        current = " [当前出口]" if out["tag"] == rule["outboundTag"] else ""
+        label = f"{inbound.get('_remark', tag)} :{inbound['port']} → {protocol.upper()} {server['address']}:{server['port']}{current}"
+        print("\x1f".join([tag, out["tag"], label]))
+PYEOF
+) || return 1
+    if [[ -z "$choices" ]]; then
+        echo "没有可选出站；删除整条节点请选择菜单 6。"
+        return 1
+    fi
+    while IFS= read -r row; do
+        items+=("$row")
+        label="${row#*$'\x1f'}"
+        printf '%s) %s\n' "$((++index))" "${label#*$'\x1f'}"
+    done <<< "$choices"
+    prompt_read number -p "出站编号（0 返回）: " || return 1
+    [[ -n "$number" && "$number" != 0 ]] || return 1
     if [[ ! "$number" =~ ^[1-9][0-9]*$ ]]; then
         echo "编号无效。" >&2
         return 1
     fi
-    SELECTED_OUTBOUND=$(python3 - "$CONFIG_FILE" "$SELECTED_ENTRY" "$number" <<'PYEOF'
-import json, sys
-config = json.load(open(sys.argv[1]))
-tag = sys.argv[2]
-members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
-if not members:
-    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
-    members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
-index = int(sys.argv[3]) - 1
-if index >= len(members):
-    raise SystemExit("出站编号无效。")
-print(members[index]["tag"])
-PYEOF
-) || return 1
+    if (( ${#number} > 9 || number > ${#items[@]} )); then
+        echo "出站编号无效。" >&2
+        return 1
+    fi
+    IFS=$'\x1f' read -r SELECTED_ENTRY SELECTED_OUTBOUND label <<< "${items[number-1]}"
 }
 
 apply_change() {
@@ -777,9 +819,22 @@ apply_change() {
         rm -f -- "$NEW_CONFIG"
         return 1
     fi
-    if [[ "$SERVICE_MANAGER" == openrc ]]; then
+    if [[ "$action" == delete-inbound ]] && python3 -c 'import json,sys; sys.exit(bool(json.load(open(sys.argv[1]))["inbounds"]))' "$CONFIG_FILE"; then
+        if ! service_control stop || ! service_control disable; then
+            cp -a "$CONFIG_BACKUP" "$CONFIG_FILE" || return 1
+            apply_config_permissions "$CONFIG_FILE" || return 1
+            service_control enable || return 1
+            restart_with_rollback || return 1
+            echo "停止服务失败，已恢复原节点配置。" >&2
+            return 1
+        fi
+        echo "已删除最后一个节点，中转服务已停止。"
+    elif [[ "$SERVICE_MANAGER" == openrc ]]; then
         start_service || return 1
     elif [[ -f "$SERVICE_FILE" ]] && grep -Fxq "ExecStart=\"$XRAY_BIN\" run -config \"$CONFIG_FILE\"" "$SERVICE_FILE"; then
+        if [[ "$action" == add-vless || "$action" == add-socks ]]; then
+            service_control enable || return 1
+        fi
         restart_with_rollback || return 1
     else
         start_service || return 1
@@ -787,6 +842,19 @@ apply_change() {
     if [[ "$action" == add-vless || "$action" == add-socks || "$action" == edit-inbound ]]; then
         setup_firewall || return 1
         print_result || return 1
+    fi
+    if [[ "$action" == delete-inbound && -f "$INFO_FILE" ]]; then
+        python3 - "$CONFIG_FILE" "$INFO_FILE" <<'PYEOF' || return 1
+import json, sys
+from urllib.parse import urlsplit
+config = json.load(open(sys.argv[1]))
+ports = {node["port"] for node in config["inbounds"]}
+with open(sys.argv[2]) as file:
+    links = [line for line in file if urlsplit(line.strip()).port in ports]
+with open(sys.argv[2], "w") as file:
+    file.writelines(links)
+PYEOF
+        echo "节点及其专用出站已删除，节点链接已更新。"
     fi
     echo "配置已更新。"
 }
@@ -824,15 +892,33 @@ manage_menu() {
         echo "3) 为入站添加出站（SOCKS5 / VLESS）"
         echo "4) 切换当前出站"
         echo "5) 编辑出站"
-        echo "6) 删除出站"
+        echo "6) 删除整条节点（含其出站）"
         echo "7) 修改入站名称和端口"
         echo "8) 查看节点链接"
         echo "9) 新增 SOCKS5 入站"
+        echo "10) 仅删除一个出站（保留节点）"
         echo "0) 退出"
         prompt_read choice -p "选择: " || return 0
         case "$choice" in
             0) return 0 ;;
             1) show_nodes ;;
+            6|10)
+                SELECTED_ENTRY="" SELECTED_OUTBOUND=""
+                if [[ "$choice" == 6 ]]; then
+                    echo "选择要删除的节点，将一并删除它的专用出站。"
+                    select_entry "删除节点编号（0 返回）" || continue
+                    action=delete-inbound
+                else
+                    echo "选择要删除的出站；删除当前出口会切换到剩余出站。唯一出站不列出，需删整条节点请选择 6。"
+                    select_outbound delete || continue
+                    action=delete-outbound
+                fi
+                if apply_change "$action" "$SELECTED_ENTRY" "$SELECTED_OUTBOUND"; then
+                    show_nodes
+                else
+                    echo "删除失败，请根据以上错误重试。" >&2
+                fi
+                ;;
             2|9)
                 action=vless
                 [[ "$choice" != 9 ]] || action=socks
@@ -840,7 +926,7 @@ manage_menu() {
                     echo "新增入站失败，请根据以上错误修正后重试。" >&2
                 fi
                 ;;
-            3|4|5|6|7)
+            3|4|5|7)
                 select_entry || continue
                 case "$choice" in
                     3)
@@ -848,10 +934,7 @@ manage_menu() {
                         action=add-outbounds
                         SELECTED_OUTBOUND=""
                         ;;
-                    4|5|6)
-                        if [[ "$choice" == 6 ]]; then
-                            echo "删除当前出口后将切换到第一个剩余出站；最后一个出站不能删除。"
-                        fi
+                    4|5)
                         select_outbound || continue
                         case "$choice" in
                             4) action=switch-outbound ;;
@@ -865,7 +948,6 @@ manage_menu() {
                                 NODES=("$PARSED_NODE")
                                 action=edit-outbound
                                 ;;
-                            6) action=delete-outbound ;;
                         esac
                         ;;
                     7)
