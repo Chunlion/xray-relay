@@ -460,7 +460,7 @@ else:
         if not selected:
             raise SystemExit("出站不属于该入口。")
         if len(members) == 1:
-            raise SystemExit("这是节点唯一的出站；删除整条节点请选择菜单 6。")
+            raise SystemExit("这是节点唯一的出站；删除整条节点请选择主菜单 4。")
         outbounds.remove(selected)
         if rule["outboundTag"] == selected["tag"]:
             rule["outboundTag"] = next(out["tag"] for out in members if out is not selected)
@@ -791,7 +791,7 @@ for inbound in config["inbounds"]:
 PYEOF
 ) || return 1
     if [[ -z "$choices" ]]; then
-        echo "没有可选出站；删除整条节点请选择菜单 6。"
+        echo "没有可选出站；删除整条节点请选择主菜单 4。"
         return 1
     fi
     while IFS= read -r row; do
@@ -883,33 +883,110 @@ deploy_inbound() {
     apply_change "add-$protocol"
 }
 
-manage_menu() {
-    local choice raw action
+add_node_menu() {
+    local choice protocol
     while true; do
         echo
-        echo "1) 查看入站和出站"
-        echo "2) 新增 VLESS"
-        echo "3) 为入站添加出站（SOCKS5 / VLESS）"
-        echo "4) 切换当前出站"
-        echo "5) 编辑出站"
-        echo "6) 删除整条节点（含其出站）"
-        echo "7) 修改入站名称和端口"
-        echo "8) 查看节点链接"
-        echo "9) 新增 SOCKS5 入站"
-        echo "10) 仅删除一个出站（保留节点）"
+        echo "添加节点 — 选择入站协议"
+        echo "1) VLESS + REALITY"
+        echo "2) SOCKS5（账号密码认证）"
+        echo "0) 返回主菜单"
+        prompt_read choice -p "选择: " || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) protocol=vless ;;
+            2) protocol=socks ;;
+            *) echo "选项无效。" >&2; continue ;;
+        esac
+        if deploy_inbound "$protocol"; then
+            return 0
+        fi
+        echo "部署失败。请根据以上错误修正后重试，或选择 0 返回。" >&2
+    done
+}
+
+manage_node_menu() {
+    local choice raw action
+    select_entry || return 0
+    while true; do
+        echo
+        show_nodes "$SELECTED_ENTRY" || return 1
+        echo "1) 添加出站（SOCKS5 / VLESS）"
+        echo "2) 切换当前出站"
+        echo "3) 编辑出站"
+        echo "4) 修改节点名称和端口"
+        echo "0) 返回主菜单"
+        prompt_read choice -p "选择: " || return 0
+        SELECTED_OUTBOUND=""
+        case "$choice" in
+            0) return 0 ;;
+            1)
+                collect_nodes || continue
+                action=add-outbounds
+                ;;
+            2|3)
+                select_outbound || continue
+                if [[ "$choice" == 2 ]]; then
+                    action=switch-outbound
+                else
+                    prompt_read raw -s -p "新的 SOCKS5 / VLESS 链接: " || continue
+                    echo
+                    if ! parse_outbound_raw "$raw"; then
+                        echo "格式错误: $PARSE_ERROR" >&2
+                        continue
+                    fi
+                    NODES=("$PARSED_NODE")
+                    action=edit-outbound
+                fi
+                ;;
+            4)
+                prompt_read EDIT_NAME -p "新名称（回车保留）: " || continue
+                prompt_read EDIT_PORT -p "新端口（回车保留）: " || continue
+                VPS_IP=$(get_ip) || continue
+                action=edit-inbound
+                ;;
+            *) echo "选项无效。" >&2; continue ;;
+        esac
+        if ! apply_change "$action" "$SELECTED_ENTRY" "$SELECTED_OUTBOUND"; then
+            echo "操作失败。" >&2
+        fi
+    done
+}
+
+manage_menu() {
+    local choice action
+    while true; do
+        echo
+        echo "1) 查看节点"
+        echo "2) 添加节点"
+        echo "3) 管理节点"
+        echo "4) 删除节点（含其出站）"
+        echo "5) 删除单个出站（保留节点）"
+        echo "6) 查看节点链接"
         echo "0) 退出"
         prompt_read choice -p "选择: " || return 0
         case "$choice" in
             0) return 0 ;;
+            2) add_node_menu; continue ;;
+            1|3|4|5|6)
+                if [[ ! -f "$CONFIG_FILE" ]]; then
+                    echo "暂无节点，请选择 2 添加节点。"
+                    continue
+                fi
+                ;;
+            *) echo "选项无效。" >&2; continue ;;
+        esac
+        case "$choice" in
             1) show_nodes ;;
-            6|10)
+            3) manage_node_menu ;;
+            4|5)
                 SELECTED_ENTRY="" SELECTED_OUTBOUND=""
-                if [[ "$choice" == 6 ]]; then
+                if [[ "$choice" == 4 ]]; then
                     echo "选择要删除的节点，将一并删除它的专用出站。"
                     select_entry "删除节点编号（0 返回）" || continue
                     action=delete-inbound
                 else
-                    echo "选择要删除的出站；删除当前出口会切换到剩余出站。唯一出站不列出，需删整条节点请选择 6。"
+                    echo "选择要删除的出站；删除当前出口会切换到剩余出站。唯一出站不列出，需删整条节点请选择主菜单 4。"
                     select_outbound delete || continue
                     action=delete-outbound
                 fi
@@ -919,87 +996,21 @@ manage_menu() {
                     echo "删除失败，请根据以上错误重试。" >&2
                 fi
                 ;;
-            2|9)
-                action=vless
-                [[ "$choice" != 9 ]] || action=socks
-                if ! deploy_inbound "$action"; then
-                    echo "新增入站失败，请根据以上错误修正后重试。" >&2
-                fi
-                ;;
-            3|4|5|7)
-                select_entry || continue
-                case "$choice" in
-                    3)
-                        collect_nodes || continue
-                        action=add-outbounds
-                        SELECTED_OUTBOUND=""
-                        ;;
-                    4|5)
-                        select_outbound || continue
-                        case "$choice" in
-                            4) action=switch-outbound ;;
-                            5)
-                                prompt_read raw -s -p "新的 SOCKS5 / VLESS 链接: " || continue
-                                echo
-                                if ! parse_outbound_raw "$raw"; then
-                                    echo "格式错误: $PARSE_ERROR" >&2
-                                    continue
-                                fi
-                                NODES=("$PARSED_NODE")
-                                action=edit-outbound
-                                ;;
-                        esac
-                        ;;
-                    7)
-                        prompt_read EDIT_NAME -p "新名称（回车保留）: " || continue
-                        prompt_read EDIT_PORT -p "新端口（回车保留）: " || continue
-                        VPS_IP=$(get_ip) || continue
-                        action=edit-inbound
-                        SELECTED_OUTBOUND=""
-                        ;;
-                esac
-                if ! apply_change "$action" "$SELECTED_ENTRY" "$SELECTED_OUTBOUND"; then
-                    echo "操作失败。" >&2
-                fi
-                ;;
-            8)
+            6)
                 if VPS_IP=$(get_ip); then print_result; fi
                 ;;
-            *) echo "选项无效。" >&2 ;;
         esac
     done
 }
 
 main() {
-    local choice
     preflight_check
     trap '[[ -z "$NEW_CONFIG" ]] || rm -f -- "$NEW_CONFIG"' EXIT
     echo "Xray VLESS / SOCKS5 → SOCKS5 / VLESS"
-    while true; do
-        if [[ -f "$CONFIG_FILE" ]]; then
-            install_xray
-            echo "已检测到中转配置，进入管理菜单。"
-            manage_menu
-            return
-        fi
-        echo
-        echo "1) 创建 VLESS 入站"
-        echo "2) 创建 SOCKS5 入站"
-        echo "0) 退出"
-        prompt_read choice -p "选择: " || return 0
-        case "$choice" in
-            0) return 0 ;;
-            1|2)
-                if [[ "$choice" == 1 ]]; then choice=vless; else choice=socks; fi
-                if deploy_inbound "$choice"; then
-                    manage_menu
-                    return
-                fi
-                echo "部署失败。请根据以上错误修正后重新选择部署，或选择 0 退出。" >&2
-                ;;
-            *) echo "选项无效。" >&2 ;;
-        esac
-    done
+    if [[ -f "$CONFIG_FILE" ]]; then
+        install_xray
+    fi
+    manage_menu
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

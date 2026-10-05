@@ -246,18 +246,18 @@ assert [node["port"] for node in config["inbounds"]] == [20001, 20003]
 assert open(sys.argv[3]).read().splitlines()[0] == open(sys.argv[2]).read().strip()
 PYEOF
 manage_menu > "$TMP_DIR/menu.out" <<'EOF'
-4
+3
 1
 2
-3
+2
 1
 socks5://fourth.example:1083
 
-5
-1
+3
 4
 socks5://edited.example:1084
-10
+0
+5
 3
 0
 EOF
@@ -289,9 +289,9 @@ fi
     print_result > "$TMP_DIR/delete-links.out"
     cp "$INFO_FILE" "$TMP_DIR/links-before-delete.txt"
     manage_menu > "$TMP_DIR/delete-node-menu.out" <<'EOF'
-6
+4
 0
-6
+4
 1
 0
 EOF
@@ -312,7 +312,7 @@ PYEOF
         cmp "$CONFIG_FILE" "$TMP_DIR/last-node.json"
     )
     manage_menu > "$TMP_DIR/delete-final-menu.out" <<'EOF'
-6
+4
 1
 0
 EOF
@@ -571,6 +571,7 @@ generate_config() {
     fi
 }
 (main <<'EOF'
+2
 1
 socks5://proxy.example:1080
 
@@ -580,15 +581,42 @@ socks5://proxy.example:1080
 0
 EOF
 ) > "$TMP_DIR/first.out" 2>&1
-grep -q '1) 创建 VLESS 入站' "$TMP_DIR/first.out"
+grep -q '2) 添加节点' "$TMP_DIR/first.out"
+grep -q '1) VLESS + REALITY' "$TMP_DIR/first.out"
 grep -q 'mock configuration rejected' "$TMP_DIR/first.out"
 grep -q '部署失败。' "$TMP_DIR/first.out"
 grep -q '配置校验通过。' "$TMP_DIR/first.out"
-grep -q '3) 为入站添加出站' "$TMP_DIR/first.out"
+grep -q '3) 管理节点' "$TMP_DIR/first.out"
 if grep -Eq 'diagnostic-(user|password|id|private)' "$TMP_DIR/first.out"; then
     echo '首次部署错误提示不得泄露凭据' >&2; exit 1
 fi
 [[ -f "$CONFIG_FILE" ]]
+(
+    CONFIG_FILE="$TMP_DIR/socks-first/config.json"
+    INFO_FILE="$TMP_DIR/socks-first/nodes.txt"
+    SERVICE_FILE="$TMP_DIR/socks-first/relay.service"
+    DEPLOY_ATTEMPTS=1
+    generate_keys() { echo 'SOCKS5 不应生成 REALITY 密钥' >&2; return 1; }
+    main > "$TMP_DIR/socks-first.out" 2>&1 <<'EOF'
+1
+2
+0
+2
+9
+2
+socks5://proxy.example:1080
+
+0
+EOF
+    grep -q '暂无节点，请选择 2 添加节点。' "$TMP_DIR/socks-first.out"
+    grep -q '选项无效。' "$TMP_DIR/socks-first.out"
+    python3 - "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert len(config["inbounds"]) == 1
+assert config["inbounds"][0]["protocol"] == "socks"
+PYEOF
+)
 if [[ -n "$XRAY_TEST_BIN" ]]; then
     echo 'PASS: 配置通过真实 Xray 核心校验'
 fi
