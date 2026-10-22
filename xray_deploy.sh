@@ -291,6 +291,143 @@ get_ip() {
     printf '%s\n' "$candidate"
 }
 
+probe_socks_udp() {
+    local node="$1" report relay kind e2e
+    report=$(NODE_JSON="$node" python3 - <<'PYEOF'
+import ipaddress, json, os, socket, struct, sys
+
+node = json.loads(os.environ["NODE_JSON"])
+if node.get("protocol") != "socks":
+    print("SKIP")
+    sys.exit(0)
+server = node["settings"]["servers"][0]
+host, port = server["address"], int(server["port"])
+account = (server.get("users") or [{}])[0]
+user, password = account.get("user", ""), account.get("pass", "")
+
+def out(message):
+    print(message)
+    sys.exit(0)
+
+try:
+    control = socket.create_connection((host, port), timeout=4)
+except OSError as error:
+    out("CONNECT:" + (error.strerror or "无法建立连接"))
+
+def read_exact(size):
+    data = b""
+    while len(data) < size:
+        chunk = control.recv(size - len(data))
+        if not chunk:
+            raise OSError("连接提前关闭")
+        data += chunk
+    return data
+
+try:
+    control.sendall(b"\x05\x01" + (b"\x02" if user else b"\x00"))
+    reply = read_exact(2)
+    if reply[1] == 2:
+        name, secret = user.encode(), password.encode()
+        control.sendall(b"\x01" + bytes([len(name)]) + name + bytes([len(secret)]) + secret)
+        if read_exact(2)[1] != 0:
+            out("AUTH")
+    elif reply[1] != 0:
+        out("METHOD:%d" % reply[1])
+    control.sendall(b"\x05\x03\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+    header = read_exact(4)
+    if header[1] != 0:
+        out("ASSOC:%d" % header[1])
+    atyp = header[3]
+    if atyp == 1:
+        relay_host = socket.inet_ntoa(read_exact(4))
+    elif atyp == 4:
+        relay_host = socket.inet_ntop(socket.AF_INET6, read_exact(16))
+    elif atyp == 3:
+        relay_host = read_exact(read_exact(1)[0]).decode(errors="replace")
+    else:
+        out("ASSOC:地址类型 %d 不支持" % atyp)
+    relay_port = struct.unpack("!H", read_exact(2))[0]
+except OSError:
+    out("ASSOC:连接中断")
+finally:
+    control.close()
+
+if atyp == 3:
+    kind = "domain"
+else:
+    address = ipaddress.ip_address(relay_host)
+    if address.is_unspecified:
+        kind = "unspecified"
+    elif address.is_loopback:
+        kind = "loopback"
+    elif address.is_link_local:
+        kind = "linklocal"
+    elif address.is_private:
+        kind = "private"
+    else:
+        kind = "public"
+
+# 用一次 DNS 查询验证真实的 UDP 出口；0.0.0.0 按 Xray 的行为改用服务器地址。
+target = host if kind == "unspecified" else relay_host
+family = socket.AF_INET6 if ":" in target else socket.AF_INET
+query = struct.pack("!HHHHHH", 0x5A5A, 0x0100, 1, 0, 0, 0)
+query += b"\x07example\x03com\x00" + struct.pack("!HH", 1, 1)
+packet = b"\x00\x00\x00\x01" + socket.inet_aton("1.1.1.1") + struct.pack("!H", 53) + query
+datagram = socket.socket(family, socket.SOCK_DGRAM)
+datagram.settimeout(3)
+try:
+    datagram.sendto(packet, (target, relay_port))
+    e2e = "ok" if datagram.recv(2048)[10:12] == b"\x5a\x5a" else "bad"
+except OSError:
+    e2e = "timeout"
+finally:
+    datagram.close()
+print(f"ASSOC relay={relay_host}:{relay_port} kind={kind} e2e={e2e}")
+PYEOF
+) || report="CONNECT:探测脚本异常"
+    case "$report" in
+        SKIP)
+            return 0
+            ;;
+        CONNECT:*)
+            echo "警告：无法连接上游 SOCKS5 ${PARSED_HOST}:${PARSED_PORT}（${report#CONNECT:}），UDP 未验证。" >&2
+            ;;
+        AUTH)
+            echo "警告：上游 SOCKS5 认证失败，UDP 未验证。" >&2
+            ;;
+        METHOD:*)
+            echo "警告：上游 SOCKS5 不接受所需的认证方式，UDP 未验证。" >&2
+            ;;
+        ASSOC:7)
+            echo "警告：上游拒绝 UDP ASSOCIATE，不支持 UDP 转发。Wi-Fi Calling 需要 UDP，请更换上游或改用它的 VLESS 接入。" >&2
+            ;;
+        ASSOC:*)
+            echo "警告：上游拒绝 UDP ASSOCIATE（${report#ASSOC:}），UDP 不可用。" >&2
+            ;;
+        ASSOC\ relay=*)
+            relay=${report#*relay=}; relay=${relay%% *}
+            kind=${report#*kind=}; kind=${kind%% *}
+            e2e=${report##*e2e=}
+            case "$e2e" in
+                ok)
+                    echo "UDP 出口已确认（DNS 查询往返正常）。"
+                    ;;
+                *)
+                    case "$kind" in
+                        loopback|private|linklocal)
+                            echo "警告：上游返回的 UDP 中继地址 ${relay} 是本机或内网地址，Xray 会把 UDP 直接发往该地址，链路必然中断。" >&2
+                            echo "      请在上游把 SOCKS5 入站的监听 IP 改为 0.0.0.0 或公网地址（3x-ui 默认是 127.0.0.1）；改不了就改用该上游的 VLESS 接入。" >&2
+                            ;;
+                        *)
+                            echo "警告：UDP 关联已建立，但向 1.1.1.1:53 的测试查询无响应；上游可能限制 UDP 目标或存在分片问题，请用手机实测 Wi-Fi Calling。" >&2
+                            ;;
+                    esac
+                    ;;
+            esac
+            ;;
+    esac
+}
+
 collect_nodes() {
     local raw
     NODES=()
@@ -305,6 +442,9 @@ collect_nodes() {
         if parse_outbound_raw "$raw"; then
             NODES+=("$PARSED_NODE")
             echo "已添加出站 ${#NODES[@]}: ${PARSED_HOST}:${PARSED_PORT}"
+            if [[ -t 0 ]]; then
+                probe_socks_udp "$PARSED_NODE"
+            fi
         else
             echo "格式错误: $PARSE_ERROR" >&2
         fi
@@ -953,6 +1093,30 @@ manage_node_menu() {
     done
 }
 
+check_udp_menu() {
+    local host port node count=0
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "暂无节点，请选择 2 添加节点。"
+        return 0
+    fi
+    while IFS=$'\t' read -r host port node; do
+        [[ -n "$node" ]] || continue
+        count=$((count + 1))
+        echo "SOCKS5 出站 ${count}: ${host}:${port}"
+        PARSED_HOST="$host" PARSED_PORT="$port"
+        probe_socks_udp "$node"
+    done < <(python3 - "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+for out in json.load(open(sys.argv[1]))["outbounds"]:
+    if out.get("protocol") != "socks":
+        continue
+    server = out["settings"]["servers"][0]
+    print("%s\t%s\t%s" % (server["address"], server["port"], json.dumps(out, ensure_ascii=False)))
+PYEOF
+)
+    (( count )) || echo "配置中没有 SOCKS5 出站，UDP 由 VLESS 出站端到端承载。"
+}
+
 manage_menu() {
     local choice action
     while true; do
@@ -963,12 +1127,13 @@ manage_menu() {
         echo "4) 删除节点（含其出站）"
         echo "5) 删除单个出站（保留节点）"
         echo "6) 查看节点链接"
+        echo "7) 检查 SOCKS5 出站的 UDP"
         echo "0) 退出"
         prompt_read choice -p "选择: " || return 0
         case "$choice" in
             0) return 0 ;;
             2) add_node_menu; continue ;;
-            1|3|4|5|6)
+            1|3|4|5|6|7)
                 if [[ ! -f "$CONFIG_FILE" ]]; then
                     echo "暂无节点，请选择 2 添加节点。"
                     continue
@@ -999,6 +1164,7 @@ manage_menu() {
             6)
                 if VPS_IP=$(get_ip); then print_result; fi
                 ;;
+            7) check_udp_menu ;;
         esac
     done
 }
