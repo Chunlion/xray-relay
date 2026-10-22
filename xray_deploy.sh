@@ -8,9 +8,15 @@ INFO_FILE="/root/xray_nodes_info.txt"
 SERVICE_FILE="/etc/systemd/system/xray-relay.service"
 SERVICE_MANAGER=systemd
 SERVICE_LOG="/var/log/xray-relay.log"
-REALITY_HOSTS=(www.bunny.net www.cdn77.com www.azion.com gcore.com)
+REALITY_HOSTS=(www.bosch.com www.miele.com www.nespresso.com www.schaeffler.com
+    www.siemens.com www.kuka.com)
 REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-}"
 REALITY_DEST="${REALITY_DEST:-}"
+SNI_BLOCKED=(google.com youtube.com facebook.com amazon.com wikipedia.org twitter.com
+    instagram.com netflix.com microsoft.com apple.com cloudflare.com akamai.com
+    fastly.com cloudfront.net bing.com yahoo.com github.com openai.com tiktok.com
+    reddit.com linkedin.com whatsapp.com telegram.org baidu.com qq.com taobao.com
+    jd.com weibo.com bilibili.com alipay.com)
 CLIENT_FP="${CLIENT_FP:-chrome}"
 START_PORT="${START_PORT:-}"
 XRAY_BIN=""
@@ -25,6 +31,19 @@ prompt_read() {
         return 1
     fi
     printf -v "$variable" '%s' "$value"
+}
+
+validate_sni() {
+    local name="${1:-}" blocked
+    name="${name,,}"
+    [[ ${#name} -le 253 ]] || return 1
+    [[ "$name" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || return 1
+    for blocked in "${SNI_BLOCKED[@]}"; do
+        if [[ "$name" == "$blocked" || "$name" == *".$blocked" ]]; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 clear_screen() {
@@ -1073,6 +1092,10 @@ deploy_inbound() {
         generate_keys || return 1
         if [[ -z "$REALITY_SERVER_NAME" ]]; then
             REALITY_SERVER_NAME="${REALITY_HOSTS[RANDOM % ${#REALITY_HOSTS[@]}]}"
+        elif ! validate_sni "$REALITY_SERVER_NAME"; then
+            echo "REALITY_SERVER_NAME 不是合法域名，或属于过于大众化的站点：${REALITY_SERVER_NAME}" >&2
+            echo "请换成具体站点的域名，例如 www.bosch.com。" >&2
+            return 1
         fi
         REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
         echo "REALITY 回落目标: ${REALITY_SERVER_NAME}"
