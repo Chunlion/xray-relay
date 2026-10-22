@@ -8,8 +8,9 @@ INFO_FILE="/root/xray_nodes_info.txt"
 SERVICE_FILE="/etc/systemd/system/xray-relay.service"
 SERVICE_MANAGER=systemd
 SERVICE_LOG="/var/log/xray-relay.log"
-REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
-REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
+REALITY_HOSTS=(www.bunny.net www.cdn77.com www.azion.com gcore.com)
+REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-}"
+REALITY_DEST="${REALITY_DEST:-}"
 CLIENT_FP="${CLIENT_FP:-chrome}"
 START_PORT="${START_PORT:-}"
 XRAY_BIN=""
@@ -24,6 +25,22 @@ prompt_read() {
         return 1
     fi
     printf -v "$variable" '%s' "$value"
+}
+
+clear_screen() {
+    [[ -t 1 ]] || return 0
+    if [[ -n "${TERM:-}" ]] && command -v clear >/dev/null 2>&1; then
+        clear || true
+    else
+        printf '\033[H\033[2J\033[3J'
+    fi
+}
+
+pause_return() {
+    local ignored
+    [[ -t 0 ]] || return 0
+    echo
+    prompt_read ignored -p "按回车返回菜单" || true
 }
 
 parse_outbound_raw() {
@@ -470,13 +487,16 @@ generate_keys() {
 
 generate_config() {
     local target="$1" action="${2:-add-vless}" entry="${3:-}" outbound="${4:-}" occupied occupied_udp
+    local reality_name="${REALITY_SERVER_NAME:-${REALITY_HOSTS[0]}}"
+    local reality_dest="${REALITY_DEST:-${reality_name}:443}"
     occupied=$(ss -H -ltn) || return 1
     occupied_udp=$(ss -H -lun) || return 1
     CONFIG_FILE="$CONFIG_FILE" NEW_CONFIG_FILE="$target" ACTION="$action" ENTRY_TAG="$entry" \
     OUTBOUND_TAG="$outbound" EDIT_PORT="${EDIT_PORT:-}" EDIT_NAME="${EDIT_NAME:-}" \
     VPS_IP="${VPS_IP:-}" UUID="${UUID:-}" PRIVATE_KEY="${PRIVATE_KEY:-}" SHORT_ID="${SHORT_ID:-}" \
-    START_PORT="$START_PORT" OCCUPIED="$occupied" UDP_OCCUPIED="$occupied_udp" REALITY_DEST="$REALITY_DEST" \
-    REALITY_SERVER_NAME="$REALITY_SERVER_NAME" NODES_DATA="$(printf '%s\n' "${NODES[@]}")" \
+    START_PORT="$START_PORT" OCCUPIED="$occupied" UDP_OCCUPIED="$occupied_udp" \
+    REALITY_DEST="$reality_dest" REALITY_SERVER_NAME="$reality_name" \
+    NODES_DATA="$(printf '%s\n' "${NODES[@]}")" \
     python3 - <<'PYEOF'
 import copy, json, os, re, secrets
 source = os.environ["CONFIG_FILE"]
@@ -513,17 +533,17 @@ if action in ("add-vless", "add-socks"):
     protocol = action[4:]
     if protocol == "socks":
         used.update(used_udp)
-    if protocol == "vless" and not os.environ["START_PORT"]:
-        available = [port for port in range(10000, 65536) if port not in used]
-        if not available:
-            raise SystemExit("没有可用的监听端口。")
-        port = secrets.choice(available)
-    else:
-        port = int(os.environ["START_PORT"] or "20000")
+    if os.environ["START_PORT"]:
+        port = int(os.environ["START_PORT"])
         while port in used:
             port += 1
         if port > 65535:
             raise SystemExit("没有可用的监听端口。")
+    else:
+        available = [candidate for candidate in range(10000, 65536) if candidate not in used]
+        if not available:
+            raise SystemExit("没有可用的监听端口。")
+        port = secrets.choice(available)
     index = 1
     while any(inbound["tag"] == f"{protocol}-in-{index}" for inbound in inbounds):
         index += 1
@@ -861,34 +881,72 @@ PYEOF
 }
 
 show_nodes() {
-    python3 - "$CONFIG_FILE" "${1:-}" "${2:-}" <<'PYEOF'
+    python3 - "$CONFIG_FILE" "${1:-}" <<'PYEOF'
 import json, sys
+
 config = json.load(open(sys.argv[1]))
-if not config["inbounds"]:
+inbounds = config["inbounds"]
+if not inbounds:
     print("暂无节点，请先新增 VLESS 或 SOCKS5 节点。")
-    sys.exit(1 if sys.argv[3] == "entries" else 0)
-for index, inbound in enumerate(config["inbounds"], 1):
+    sys.exit(0)
+filter_tag = sys.argv[2] if len(sys.argv) > 2 else ""
+shown = 0
+
+def field(source, key):
+    item = source.get(key) if isinstance(source, dict) else None
+    return "-" if item in (None, "", [], {}) else item
+
+for index, inbound in enumerate(inbounds, 1):
     tag = inbound["tag"]
-    if sys.argv[2] and tag != sys.argv[2]:
+    if filter_tag and tag != filter_tag:
         continue
+    shown += 1
     rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
     members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
     if not members:
         members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
-    print(f"节点 {index}) {inbound.get('_remark', tag)}  {inbound['protocol'].upper()} :{inbound['port']}  出站 {len(members)} 个")
-    if sys.argv[3] == "entries":
-        continue
+    settings = inbound.get("settings") or {}
+    stream = inbound.get("streamSettings") or {}
+    if shown > 1:
+        print()
+    print(f"节点 {index}) {inbound.get('_remark', tag)}")
+    print(f"  协议  {str(field(inbound, 'protocol')).upper()}")
+    print(f"  监听  {field(inbound, 'listen')}:{field(inbound, 'port')}")
+    if inbound.get("protocol") == "vless":
+        client = (settings.get("clients") or [{}])[0]
+        print(f"  传输  {str(field(stream, 'network')).upper()}")
+        print(f"  安全  {str(field(stream, 'security')).upper()}")
+        print(f"  标识  {field(client, 'id')}")
+        print(f"  流控  {field(client, 'flow')}")
+        print(f"  加密  {field(settings, 'decryption')}")
+        reality = stream.get("realitySettings") or {}
+        tls = stream.get("tlsSettings") or {}
+        if reality:
+            print(f"  域名  {','.join(reality.get('serverNames') or []) or '-'}")
+            print(f"  目标  {field(reality, 'dest')}")
+            print(f"  短ID  {','.join(reality.get('shortIds') or []) or '-'}")
+        if tls:
+            print(f"  域名  {field(tls, 'serverName')}")
+    else:
+        account = (settings.get("accounts") or [{}])[0]
+        print(f"  账号  {field(account, 'user')}")
+        print(f"  UDP   {'开' if settings.get('udp') else '关'}")
+    print(f"  出站  {len(members)} 个")
     for number, outbound in enumerate(members, 1):
         protocol = outbound["protocol"]
         server = outbound["settings"]["vnext" if protocol == "vless" else "servers"][0]
-        current = " [当前]" if outbound["tag"] == rule["outboundTag"] else ""
-        print(f"   出站 {number}) {protocol.upper()} {server['address']}:{server['port']}{current}")
+        address = f"[{server['address']}]" if ":" in server["address"] else server["address"]
+        current = "  [当前]" if outbound["tag"] == rule["outboundTag"] else ""
+        print(f"        {number}) {protocol.upper()} {address}:{server['port']}{current}")
+if filter_tag and not shown:
+    print("节点不存在。")
 PYEOF
 }
 
 select_entry() {
     local number
-    show_nodes "" entries || return 1
+    show_nodes || return 1
+    echo
     prompt_read number -p "${1:-节点编号（0 返回）}: " || return 1
     [[ -n "$number" && "$number" != 0 ]] || return 1
     if [[ ! "$number" =~ ^[1-9][0-9]*$ ]]; then
@@ -1013,12 +1071,17 @@ deploy_inbound() {
     if [[ "$protocol" == vless ]]; then
         echo "正在生成 VLESS UUID 和 REALITY 密钥..."
         generate_keys || return 1
+        if [[ -z "$REALITY_SERVER_NAME" ]]; then
+            REALITY_SERVER_NAME="${REALITY_HOSTS[RANDOM % ${#REALITY_HOSTS[@]}]}"
+        fi
+        REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
+        echo "REALITY 回落目标: ${REALITY_SERVER_NAME}"
     fi
     (umask 022; install -d -m 755 "$(dirname "$CONFIG_FILE")") || return 1
-    if [[ "$protocol" == vless && -z "$START_PORT" ]]; then
-        echo "正在生成配置，随机分配空闲端口..."
+    if [[ -z "$START_PORT" ]]; then
+        echo "正在生成配置，随机分配 10000-65535 的空闲端口..."
     else
-        echo "正在生成配置，从 ${START_PORT:-20000} 开始分配空闲端口..."
+        echo "正在生成配置，从 ${START_PORT} 开始顺序分配空闲端口..."
     fi
     apply_change "add-$protocol"
 }
@@ -1026,7 +1089,7 @@ deploy_inbound() {
 add_node_menu() {
     local choice protocol
     while true; do
-        echo
+        clear_screen
         echo "添加节点 — 选择入站协议"
         echo "1) VLESS + REALITY"
         echo "2) SOCKS5（账号密码认证）"
@@ -1039,6 +1102,7 @@ add_node_menu() {
             *) echo "选项无效。" >&2; continue ;;
         esac
         if deploy_inbound "$protocol"; then
+            pause_return
             return 0
         fi
         echo "部署失败。请根据以上错误修正后重试，或选择 0 返回。" >&2
@@ -1049,13 +1113,15 @@ manage_node_menu() {
     local choice raw action
     select_entry || return 0
     while true; do
-        echo
+        clear_screen
         show_nodes "$SELECTED_ENTRY" || return 1
+        echo
         echo "1) 添加出站（SOCKS5 / VLESS）"
         echo "2) 切换当前出站"
         echo "3) 编辑出站"
         echo "4) 修改节点名称和端口"
         echo "0) 返回主菜单"
+        echo
         prompt_read choice -p "选择: " || return 0
         SELECTED_OUTBOUND=""
         case "$choice" in
@@ -1090,6 +1156,7 @@ manage_node_menu() {
         if ! apply_change "$action" "$SELECTED_ENTRY" "$SELECTED_OUTBOUND"; then
             echo "操作失败。" >&2
         fi
+        pause_return
     done
 }
 
@@ -1120,6 +1187,10 @@ PYEOF
 manage_menu() {
     local choice action
     while true; do
+        clear_screen
+        echo "=============================================="
+        echo " Xray VLESS / SOCKS5 中转"
+        echo "=============================================="
         echo
         echo "1) 查看节点"
         echo "2) 添加节点"
@@ -1129,13 +1200,16 @@ manage_menu() {
         echo "6) 查看节点链接"
         echo "7) 检查 SOCKS5 出站的 UDP"
         echo "0) 退出"
+        echo
         prompt_read choice -p "选择: " || return 0
         case "$choice" in
             0) return 0 ;;
             2) add_node_menu; continue ;;
-            1|3|4|5|6|7)
+            3) manage_node_menu; continue ;;
+            1|4|5|6|7)
                 if [[ ! -f "$CONFIG_FILE" ]]; then
-                    echo "暂无节点，请选择 2 添加节点。"
+                    echo "暂无节点，请选择 2 添加节点。" >&2
+                    pause_return
                     continue
                 fi
                 ;;
@@ -1166,13 +1240,13 @@ manage_menu() {
                 ;;
             7) check_udp_menu ;;
         esac
+        pause_return
     done
 }
 
 main() {
     preflight_check
     trap '[[ -z "$NEW_CONFIG" ]] || rm -f -- "$NEW_CONFIG"' EXIT
-    echo "Xray VLESS / SOCKS5 → SOCKS5 / VLESS"
     if [[ -f "$CONFIG_FILE" ]]; then
         install_xray
     fi

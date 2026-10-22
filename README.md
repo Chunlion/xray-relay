@@ -34,15 +34,19 @@ Wi-Fi Calling 走 IPsec，依赖 UDP 500（IKE）和 UDP 4500（NAT-T）完整�
 
 VLESS 出站支持 TCP/RAW、WS、gRPC、HTTPUpgrade 和基础 XHTTP，安全类型支持 none、TLS、REALITY，可导入本脚本生成的 VLESS 链接。目前仅支持 `encryption=none`，不支持 TCP HTTP 伪装及 XHTTP `extra` 等扩展参数；无法解析的参数会提示错误。传输方式也需要已有 Xray 核心支持。
 
-脚本自动生成 VLESS 的 UUID / REALITY 密钥，或 SOCKS5 的登录账号和密码。新建 VLESS 默认从 `10000–65535` 随机选择空闲端口，SOCKS5 从 `20000` 开始分配；已有节点端口保持不变。节点链接保存至 `/root/xray_nodes_info.txt`。活动的 UFW / firewalld 会自动放行；云安全组及自定义 nftables / iptables 需自行放行入站 TCP 端口，SOCKS5 入站还需放行同端口 UDP。
+脚本自动生成 VLESS 的 UUID / REALITY 密钥，或 SOCKS5 的登录账号和密码。新建节点默认从 `10000–65535` 随机选择空闲端口：VLESS 只避开已监听的 TCP 端口，SOCKS5 还避开已监听的 UDP 端口。已有节点端口保持不变。
+
+REALITY 回落域名从 `www.bunny.net`、`www.cdn77.com`、`www.azion.com`、`gcore.com` 中随机选取，这四个站点均为覆盖六大洲的二线 CDN，避免 Cloudflare、Akamai、Fastly、CloudFront 等被重点探测的域名。指定 `REALITY_SERVER_NAME` 可固定回落域名。CDN 域名被代理圈大量使用后同样会被流量分析标记，抗识别依赖 REALITY 的握手伪装而非 SNI 冷门。节点链接保存至 `/root/xray_nodes_info.txt`。活动的 UFW / firewalld 会自动放行；云安全组及自定义 nftables / iptables 需自行放行入站 TCP 端口，SOCKS5 入站还需放行同端口 UDP。
 
 SOCKS5 入站启用账号密码认证，生成 `socks5://账号:密码@地址:端口` 链接。SOCKS5 传输不加密。
 
-指定 `START_PORT` 时改为从该端口顺序寻找空闲端口；也可修改 REALITY 目标：
+指定 `START_PORT` 时改为从该端口顺序寻找空闲端口，上限 `65535`；也可修改 REALITY 目标：
 
 ```bash
 START_PORT=30000 REALITY_SERVER_NAME=www.apple.com xrelay
 ```
+
+主菜单 `1) 查看节点` 和每次选择节点时，会逐项列出节点的协议、监听地址与端口、传输方式、安全类型、UUID、流控、加密方式、SNI、回落目标、ShortId，以及全部出站和当前出口。字段直接读自配置文件，缺失项显示 `-`，不会因某个可选字段不存在而中断列表。
 
 ## 与已有 Xray 共存
 
