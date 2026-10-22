@@ -443,7 +443,7 @@ PYEOF
     NODES=("$PARSED_NODE")
     apply_change add-outbounds socks-in-1 > "$TMP_DIR/vless-out-add.out"
     apply_change switch-outbound socks-in-1 socks5-socks-in-1-3 > "$TMP_DIR/vless-out-switch.out"
-    show_nodes > "$TMP_DIR/vless-out-list.out"
+    show_node_detail socks-in-1 > "$TMP_DIR/vless-out-list.out" 2>/dev/null
     grep -q 'VLESS 127.0.0.1:443 \[当前\]' "$TMP_DIR/vless-out-list.out"
     if [[ -n "$XRAY_TEST_BIN" ]]; then
         python3 test_socks_relay.py "$XRAY_TEST_BIN" "$CONFIG_FILE"

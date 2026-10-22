@@ -512,12 +512,13 @@ generate_config() {
     occupied_udp=$(ss -H -lun) || return 1
     CONFIG_FILE="$CONFIG_FILE" NEW_CONFIG_FILE="$target" ACTION="$action" ENTRY_TAG="$entry" \
     OUTBOUND_TAG="$outbound" EDIT_PORT="${EDIT_PORT:-}" EDIT_NAME="${EDIT_NAME:-}" \
+    EDIT_LISTEN="${EDIT_LISTEN:-}" EDIT_PROTOCOL="${EDIT_PROTOCOL:-}" \
     VPS_IP="${VPS_IP:-}" UUID="${UUID:-}" PRIVATE_KEY="${PRIVATE_KEY:-}" SHORT_ID="${SHORT_ID:-}" \
     START_PORT="$START_PORT" OCCUPIED="$occupied" UDP_OCCUPIED="$occupied_udp" \
     REALITY_DEST="$reality_dest" REALITY_SERVER_NAME="$reality_name" \
     NODES_DATA="$(printf '%s\n' "${NODES[@]}")" \
     python3 - <<'PYEOF'
-import copy, json, os, re, secrets
+import copy, ipaddress, json, os, re, secrets
 source = os.environ["CONFIG_FILE"]
 if os.path.isfile(source):
     with open(source) as file:
@@ -644,6 +645,30 @@ else:
         if rule["outboundTag"] == selected["tag"]:
             rule["outboundTag"] = next(out["tag"] for out in members if out is not selected)
     elif action == "edit-inbound":
+        target = os.environ.get("EDIT_PROTOCOL") or inbound["protocol"]
+        if target not in ("vless", "socks"):
+            raise SystemExit("协议只能是 vless 或 socks。")
+        if target != inbound["protocol"]:
+            if target == "socks":
+                inbound.pop("streamSettings", None)
+                inbound["protocol"] = "socks"
+                inbound["settings"] = {
+                    "auth": "password",
+                    "accounts": [{"user": "relay_" + secrets.token_hex(4),
+                                  "pass": secrets.token_urlsafe(24)}],
+                    "udp": True, "ip": os.environ["VPS_IP"]}
+            else:
+                if not all(os.environ[key] for key in ("UUID", "PRIVATE_KEY", "SHORT_ID")):
+                    raise SystemExit("切换为 VLESS 需要先生成 UUID 和 REALITY 密钥。")
+                inbound["protocol"] = "vless"
+                inbound["settings"] = {
+                    "clients": [{"id": os.environ["UUID"], "flow": "xtls-rprx-vision"}],
+                    "decryption": "none"}
+                inbound["streamSettings"] = {"network": "tcp", "security": "reality", "realitySettings": {
+                    "dest": os.environ["REALITY_DEST"],
+                    "serverNames": [os.environ["REALITY_SERVER_NAME"]],
+                    "privateKey": os.environ["PRIVATE_KEY"],
+                    "shortIds": [os.environ["SHORT_ID"]]}}
         if inbound["protocol"] == "socks":
             used.update(used_udp)
         raw_port = os.environ["EDIT_PORT"]
@@ -659,6 +684,16 @@ else:
             if re.search(r'[\x00-\x1f\x7f]', name):
                 raise SystemExit("名称不能包含控制字符。")
             inbound["_remark"] = name
+        listen = os.environ["EDIT_LISTEN"]
+        if listen:
+            inbound["listen"] = listen
+            if listen not in ("0.0.0.0", "::"):
+                try:
+                    ipaddress.ip_address(listen)
+                except ValueError:
+                    raise SystemExit("监听地址必须是 0.0.0.0、:: 或合法的 IP 地址。")
+            if inbound["protocol"] == "socks":
+                inbound["settings"]["ip"] = os.environ["VPS_IP"]
     else:
         raise SystemExit("未知操作。")
 with open(os.environ["NEW_CONFIG_FILE"], "w") as file:
@@ -900,7 +935,7 @@ PYEOF
 }
 
 show_nodes() {
-    python3 - "$CONFIG_FILE" "${1:-}" <<'PYEOF'
+    python3 - "$CONFIG_FILE" <<'PYEOF'
 import json, sys
 
 config = json.load(open(sys.argv[1]))
@@ -908,57 +943,118 @@ inbounds = config["inbounds"]
 if not inbounds:
     print("暂无节点，请先新增 VLESS 或 SOCKS5 节点。")
     sys.exit(0)
-filter_tag = sys.argv[2] if len(sys.argv) > 2 else ""
-shown = 0
+for index, inbound in enumerate(inbounds, 1):
+    tag = inbound["tag"]
+    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
+    members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
+    if not members:
+        members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
+    print(f"节点 {index}) {inbound.get('_remark', tag)}  "
+          f"{str(inbound.get('protocol', '-')).upper()} :{inbound.get('port', '-')}  出站 {len(members)} 个")
+PYEOF
+}
+
+show_node_detail() {
+    local tag="$1" link
+    python3 - "$CONFIG_FILE" "$tag" <<'PYEOF'
+import json, sys
+
+config = json.load(open(sys.argv[1]))
+tag = sys.argv[2]
+inbound = next((item for item in config["inbounds"] if item["tag"] == tag), None)
+if not inbound:
+    print("节点不存在。")
+    sys.exit(1)
+rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
+members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
+if not members:
+    members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
+settings = inbound.get("settings") or {}
+stream = inbound.get("streamSettings") or {}
 
 def field(source, key):
     item = source.get(key) if isinstance(source, dict) else None
     return "-" if item in (None, "", [], {}) else item
 
-for index, inbound in enumerate(inbounds, 1):
-    tag = inbound["tag"]
-    if filter_tag and tag != filter_tag:
-        continue
-    shown += 1
-    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
-    members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
-    if not members:
-        members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
-    settings = inbound.get("settings") or {}
-    stream = inbound.get("streamSettings") or {}
-    if shown > 1:
-        print()
-    print(f"节点 {index}) {inbound.get('_remark', tag)}")
-    print(f"  协议  {str(field(inbound, 'protocol')).upper()}")
-    print(f"  监听  {field(inbound, 'listen')}:{field(inbound, 'port')}")
-    if inbound.get("protocol") == "vless":
-        client = (settings.get("clients") or [{}])[0]
-        print(f"  传输  {str(field(stream, 'network')).upper()}")
-        print(f"  安全  {str(field(stream, 'security')).upper()}")
-        print(f"  标识  {field(client, 'id')}")
-        print(f"  流控  {field(client, 'flow')}")
-        print(f"  加密  {field(settings, 'decryption')}")
-        reality = stream.get("realitySettings") or {}
-        tls = stream.get("tlsSettings") or {}
-        if reality:
-            print(f"  域名  {','.join(reality.get('serverNames') or []) or '-'}")
-            print(f"  目标  {field(reality, 'dest')}")
-            print(f"  短ID  {','.join(reality.get('shortIds') or []) or '-'}")
-        if tls:
-            print(f"  域名  {field(tls, 'serverName')}")
-    else:
-        account = (settings.get("accounts") or [{}])[0]
-        print(f"  账号  {field(account, 'user')}")
-        print(f"  UDP   {'开' if settings.get('udp') else '关'}")
-    print(f"  出站  {len(members)} 个")
-    for number, outbound in enumerate(members, 1):
-        protocol = outbound["protocol"]
-        server = outbound["settings"]["vnext" if protocol == "vless" else "servers"][0]
-        address = f"[{server['address']}]" if ":" in server["address"] else server["address"]
-        current = "  [当前]" if outbound["tag"] == rule["outboundTag"] else ""
-        print(f"        {number}) {protocol.upper()} {address}:{server['port']}{current}")
-if filter_tag and not shown:
-    print("节点不存在。")
+index = config["inbounds"].index(inbound) + 1
+print(f"节点 {index}) {inbound.get('_remark', tag)}")
+print(f"  协议  {str(field(inbound, 'protocol')).upper()}")
+print(f"  监听  {field(inbound, 'listen')}:{field(inbound, 'port')}")
+if inbound.get("protocol") == "vless":
+    client = (settings.get("clients") or [{}])[0]
+    print(f"  传输  {str(field(stream, 'network')).upper()}")
+    print(f"  安全  {str(field(stream, 'security')).upper()}")
+    print(f"  标识  {field(client, 'id')}")
+    print(f"  流控  {field(client, 'flow')}")
+    print(f"  加密  {field(settings, 'decryption')}")
+    reality = stream.get("realitySettings") or {}
+    tls = stream.get("tlsSettings") or {}
+    if reality:
+        print(f"  域名  {','.join(reality.get('serverNames') or []) or '-'}")
+        print(f"  目标  {field(reality, 'dest')}")
+        print(f"  短ID  {','.join(reality.get('shortIds') or []) or '-'}")
+    if tls:
+        print(f"  域名  {field(tls, 'serverName')}")
+else:
+    account = (settings.get("accounts") or [{}])[0]
+    print(f"  账号  {field(account, 'user')}")
+    print(f"  UDP   {'开' if settings.get('udp') else '关'}")
+print(f"  出站  {len(members)} 个")
+for number, outbound in enumerate(members, 1):
+    protocol = outbound["protocol"]
+    server = outbound["settings"]["vnext" if protocol == "vless" else "servers"][0]
+    address = f"[{server['address']}]" if ":" in server["address"] else server["address"]
+    current = "  [当前]" if outbound["tag"] == rule["outboundTag"] else ""
+    print(f"        {number}) {protocol.upper()} {address}:{server['port']}{current}")
+PYEOF
+    link=$(render_link "$tag") || link=""
+    if [[ -n "$link" ]]; then
+        echo "  链接  ${link}"
+    else
+        echo "  链接  未能生成，请检查 Xray 核心与公网 IP" >&2
+    fi
+}
+
+render_link() {
+    local tag="$1"
+    [[ -n "${XRAY_BIN:-}" && -x "$XRAY_BIN" ]] || return 1
+    if [[ -z "${VPS_IP:-}" ]]; then
+        VPS_IP=$(get_ip) || return 1
+    fi
+    VPS_IP="$VPS_IP" XRAY_BIN="$XRAY_BIN" CLIENT_FP="$CLIENT_FP" \
+        python3 - "$CONFIG_FILE" "$tag" <<'PYEOF'
+import json, os, re, subprocess, sys
+from urllib.parse import urlencode, quote
+
+config = json.load(open(sys.argv[1]))
+inbound = next((item for item in config["inbounds"] if item["tag"] == sys.argv[2]), None)
+if not inbound:
+    raise SystemExit(1)
+host = os.environ["VPS_IP"]
+if ":" in host:
+    host = f"[{host}]"
+name = inbound.get("_remark", inbound["tag"])
+if inbound["protocol"] == "socks":
+    account = inbound["settings"]["accounts"][0]
+    user, password = (quote(account[key], safe="") for key in ("user", "pass"))
+    print(f"socks5://{user}:{password}@{host}:{inbound['port']}#{quote(name)}")
+    sys.exit(0)
+reality = inbound["streamSettings"]["realitySettings"]
+try:
+    key = subprocess.run([os.environ["XRAY_BIN"], "x25519", "-i", reality["privateKey"]],
+                         capture_output=True, text=True)
+except OSError:
+    raise SystemExit(1)
+if key.returncode:
+    raise SystemExit(1)
+public_key = re.search(r'^(?:Public\s*Key|Password[^:]*):\s*(\S+)', key.stdout, re.I | re.M)
+if not public_key:
+    raise SystemExit(1)
+query = urlencode({"encryption": "none", "flow": "xtls-rprx-vision", "security": "reality",
+                   "sni": reality["serverNames"][0], "fp": os.environ["CLIENT_FP"],
+                   "pbk": public_key[1], "sid": reality["shortIds"][0], "type": "tcp"})
+uuid = inbound["settings"]["clients"][0]["id"]
+print(f"vless://{uuid}@{host}:{inbound['port']}?{query}#{quote(name)}")
 PYEOF
 }
 
@@ -981,6 +1077,14 @@ if index >= len(inbounds):
 print(inbounds[index]["tag"])
 PYEOF
 ) || return 1
+}
+
+inbound_protocol() {
+    python3 - "$CONFIG_FILE" "$1" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+print(next((item["protocol"] for item in config["inbounds"] if item["tag"] == sys.argv[2]), ""))
+PYEOF
 }
 
 select_outbound() {
@@ -1133,16 +1237,16 @@ add_node_menu() {
 }
 
 manage_node_menu() {
-    local choice raw action
+    local choice raw action protocol_choice current_protocol
     select_entry || return 0
     while true; do
         clear_screen
-        show_nodes "$SELECTED_ENTRY" || return 1
+        show_node_detail "$SELECTED_ENTRY" || return 1
         echo
         echo "1) 添加出站（SOCKS5 / VLESS）"
         echo "2) 切换当前出站"
         echo "3) 编辑出站"
-        echo "4) 修改节点名称和端口"
+        echo "4) 编辑入站（名称 / 端口 / 监听 / 协议）"
         echo "0) 返回主菜单"
         echo
         prompt_read choice -p "选择: " || return 0
@@ -1169,8 +1273,26 @@ manage_node_menu() {
                 fi
                 ;;
             4)
+                current_protocol=$(inbound_protocol "$SELECTED_ENTRY") || continue
                 prompt_read EDIT_NAME -p "新名称（回车保留）: " || continue
                 prompt_read EDIT_PORT -p "新端口（回车保留）: " || continue
+                prompt_read EDIT_LISTEN -p "监听地址（回车保留，0.0.0.0 / :: / IP）: " || continue
+                prompt_read protocol_choice -p "协议（0 保留，1 VLESS，2 SOCKS5）: " || continue
+                case "$protocol_choice" in
+                    1) EDIT_PROTOCOL=vless ;;
+                    2) EDIT_PROTOCOL=socks ;;
+                    *) EDIT_PROTOCOL="" ;;
+                esac
+                if [[ "$EDIT_PROTOCOL" == vless && "$current_protocol" != vless ]]; then
+                    echo "正在生成新的 UUID 和 REALITY 密钥，切换协议后旧链接失效..."
+                    generate_keys || continue
+                    if [[ -z "$REALITY_SERVER_NAME" ]]; then
+                        REALITY_SERVER_NAME="${REALITY_HOSTS[RANDOM % ${#REALITY_HOSTS[@]}]}"
+                    fi
+                    REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
+                elif [[ "$EDIT_PROTOCOL" == socks && "$current_protocol" != socks ]]; then
+                    echo "切换协议会重新生成账号密码，旧链接失效。"
+                fi
                 VPS_IP=$(get_ip) || continue
                 action=edit-inbound
                 ;;
@@ -1181,6 +1303,13 @@ manage_node_menu() {
         fi
         pause_return
     done
+}
+
+browse_menu() {
+    select_entry "${1:-节点编号查看详情（0 返回）}" || return 0
+    clear_screen
+    show_node_detail "$SELECTED_ENTRY" || return 0
+    pause_return
 }
 
 check_udp_menu() {
@@ -1239,7 +1368,7 @@ manage_menu() {
             *) echo "选项无效。" >&2; continue ;;
         esac
         case "$choice" in
-            1) show_nodes ;;
+            1) browse_menu; continue ;;
             3) manage_node_menu ;;
             4|5)
                 SELECTED_ENTRY="" SELECTED_OUTBOUND=""
@@ -1259,7 +1388,8 @@ manage_menu() {
                 fi
                 ;;
             6)
-                if VPS_IP=$(get_ip); then print_result; fi
+                browse_menu "节点编号查看链接与详情（0 返回）"
+                continue
                 ;;
             7) check_udp_menu ;;
         esac
