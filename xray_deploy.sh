@@ -1014,18 +1014,26 @@ if inbound.get("protocol") == "vless":
         print(f"  短ID  {','.join(reality.get('shortIds') or []) or '-'}")
     if tls:
         print(f"  域名  {field(tls, 'serverName')}")
-else:
+elif inbound.get("protocol") == "socks":
     account = (settings.get("accounts") or [{}])[0]
     print(f"  账号  {field(account, 'user')}")
     print(f"  UDP   {'开' if settings.get('udp') else '关'}")
 print(f"  出站  {len(members)} 个")
 for number, outbound in enumerate(members, 1):
     protocol = outbound["protocol"]
-    server = outbound["settings"]["vnext" if protocol == "vless" else "servers"][0]
-    address = f"[{server['address']}]" if ":" in server["address"] else server["address"]
+    servers = (outbound.get("settings") or {}).get("vnext" if protocol == "vless" else "servers") or []
+    target = outbound["tag"]
+    if servers and servers[0].get("address") and servers[0].get("port"):
+        server = servers[0]
+        address = f"[{server['address']}]" if ":" in server["address"] else server["address"]
+        target = f"{address}:{server['port']}"
     current = "  [当前]" if outbound["tag"] == rule["outboundTag"] else ""
-    print(f"        {number}) {protocol.upper()} {address}:{server['port']}{current}")
+    print(f"        {number}) {protocol.upper()} {target}{current}")
 PYEOF
+    case "$(inbound_protocol "$tag")" in
+        vless|socks) ;;
+        *) return 0 ;;
+    esac
     link=$(render_link "$tag") || link=""
     if [[ -n "$link" ]]; then
         echo "  链接  ${link}"
@@ -1128,9 +1136,13 @@ for inbound in config["inbounds"]:
         continue
     for out in members:
         protocol = out["protocol"]
-        server = out["settings"]["vnext" if protocol == "vless" else "servers"][0]
+        servers = (out.get("settings") or {}).get("vnext" if protocol == "vless" else "servers") or []
+        target = out["tag"]
+        if servers and servers[0].get("address") and servers[0].get("port"):
+            server = servers[0]
+            target = f"{server['address']}:{server['port']}"
         current = " [当前出口]" if out["tag"] == rule["outboundTag"] else ""
-        label = f"{inbound.get('_remark', tag)} :{inbound['port']} → {protocol.upper()} {server['address']}:{server['port']}{current}"
+        label = f"{inbound.get('_remark', tag)} :{inbound['port']} → {protocol.upper()} {target}{current}"
         print("\x1f".join([tag, out["tag"], label]))
 PYEOF
 ) || return 1

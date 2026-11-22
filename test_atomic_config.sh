@@ -423,6 +423,25 @@ PYEOF
     fi
     grep -Fq '（vless-in-1）缺少对应路由。' "$TMP_DIR/missing-detail.out"
 )
+(
+    CONFIG_FILE="$TMP_DIR/dokodemo.json"
+    cat > "$CONFIG_FILE" <<'EOF'
+{
+  "inbounds": [{"protocol": "dokodemo-door", "tag": "shared-443-v4", "port": 443}],
+  "outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {}}],
+  "routing": {"rules": [{"inboundTag": ["shared-443-v4"], "outboundTag": "direct"}]}
+}
+EOF
+    show_node_detail shared-443-v4 > "$TMP_DIR/dokodemo-detail.out" 2>&1
+    grep -Fq '协议  DOKODEMO-DOOR' "$TMP_DIR/dokodemo-detail.out"
+    grep -Fq 'FREEDOM direct  [当前]' "$TMP_DIR/dokodemo-detail.out"
+    if grep -Eq '账号|UDP|链接|Traceback' "$TMP_DIR/dokodemo-detail.out"; then
+        echo '端口转发入站不得显示 SOCKS5 字段或链接错误' >&2; exit 1
+    fi
+    SELECTED_ENTRY=shared-443-v4
+    select_outbound > "$TMP_DIR/dokodemo-choice.out" <<< 1
+    grep -Fq 'FREEDOM direct [当前出口]' "$TMP_DIR/dokodemo-choice.out"
+)
 # SOCKS5 与 VLESS 共存，新增、切换和修改端口保留入站账号及其他入口。
 (
     CONFIG_FILE="$TMP_DIR/socks.json"
