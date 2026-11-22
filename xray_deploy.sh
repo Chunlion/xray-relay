@@ -920,6 +920,8 @@ for index, inbound in enumerate(config["inbounds"], 1):
         user, password = (quote(account[key], safe="") for key in ("user", "pass"))
         lines.append(f"socks5://{user}:{password}@{host}:{inbound['port']}#{quote(name)}")
         continue
+    if inbound["protocol"] != "vless":
+        continue
     reality = inbound["streamSettings"]["realitySettings"]
     try:
         key = subprocess.run([os.environ["XRAY_BIN"], "x25519", "-i", reality["privateKey"]],
@@ -952,7 +954,7 @@ show_nodes() {
 import json, sys
 
 config = json.load(open(sys.argv[1]))
-inbounds = config["inbounds"]
+inbounds = [item for item in config["inbounds"] if item.get("protocol") in ("vless", "socks")]
 rules = config.get("routing", {}).get("rules", [])
 if not inbounds:
     print("暂无节点，请先新增 VLESS 或 SOCKS5 节点。")
@@ -1097,7 +1099,8 @@ select_entry() {
     fi
     SELECTED_ENTRY=$(python3 - "$CONFIG_FILE" "$number" <<'PYEOF'
 import json, sys
-inbounds = json.load(open(sys.argv[1]))["inbounds"]
+config = json.load(open(sys.argv[1]))
+inbounds = [item for item in config["inbounds"] if item.get("protocol") in ("vless", "socks")]
 index = int(sys.argv[2]) - 1
 if index >= len(inbounds):
     raise SystemExit("入站编号无效。")
@@ -1121,9 +1124,12 @@ select_outbound() {
 import json, sys
 config = json.load(open(sys.argv[1]))
 rules = config.get("routing", {}).get("rules", [])
+selected_tag = sys.argv[2]
 for inbound in config["inbounds"]:
     tag = inbound["tag"]
-    if sys.argv[2] and tag != sys.argv[2]:
+    if selected_tag and tag != selected_tag:
+        continue
+    if not selected_tag and inbound.get("protocol") not in ("vless", "socks"):
         continue
     rule = next((item for item in rules if tag in item.get("inboundTag", [])), None)
     if not rule:

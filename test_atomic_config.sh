@@ -425,13 +425,15 @@ PYEOF
 )
 (
     CONFIG_FILE="$TMP_DIR/dokodemo.json"
-    cat > "$CONFIG_FILE" <<'EOF'
-{
-  "inbounds": [{"protocol": "dokodemo-door", "tag": "shared-443-v4", "port": 443}],
-  "outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {}}],
-  "routing": {"rules": [{"inboundTag": ["shared-443-v4"], "outboundTag": "direct"}]}
-}
-EOF
+    INFO_FILE="$TMP_DIR/dokodemo-links.txt"
+    python3 - "$TMP_DIR/two-vless.json" "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+config["inbounds"].insert(0, {"protocol": "dokodemo-door", "tag": "shared-443-v4", "port": 443})
+config["outbounds"].append({"protocol": "freedom", "tag": "direct", "settings": {}})
+config["routing"]["rules"].append({"inboundTag": ["shared-443-v4"], "outboundTag": "direct"})
+json.dump(config, open(sys.argv[2], "w"))
+PYEOF
     show_node_detail shared-443-v4 > "$TMP_DIR/dokodemo-detail.out" 2>&1
     grep -Fq '协议  DOKODEMO-DOOR' "$TMP_DIR/dokodemo-detail.out"
     grep -Fq 'FREEDOM direct  [当前]' "$TMP_DIR/dokodemo-detail.out"
@@ -441,6 +443,17 @@ EOF
     SELECTED_ENTRY=shared-443-v4
     select_outbound > "$TMP_DIR/dokodemo-choice.out" <<< 1
     grep -Fq 'FREEDOM direct [当前出口]' "$TMP_DIR/dokodemo-choice.out"
+    select_entry > "$TMP_DIR/managed-nodes.out" <<< 1
+    grep -Fq '节点 1) VLESS-1' "$TMP_DIR/managed-nodes.out"
+    [[ "$SELECTED_ENTRY" == vless-in-1 ]]
+    SELECTED_ENTRY=""
+    select_outbound > "$TMP_DIR/managed-outbounds.out" <<< 1
+    [[ "$SELECTED_ENTRY" == vless-in-1 ]]
+    if grep -Fq 'shared-443-v4' "$TMP_DIR/managed-nodes.out" "$TMP_DIR/managed-outbounds.out"; then
+        echo '管理列表不得包含端口转发入站' >&2; exit 1
+    fi
+    print_result > "$TMP_DIR/managed-links.out"
+    [[ $(grep -c '^vless://' "$INFO_FILE") == 2 ]]
 )
 # SOCKS5 与 VLESS 共存，新增、切换和修改端口保留入站账号及其他入口。
 (
