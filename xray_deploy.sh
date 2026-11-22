@@ -526,7 +526,8 @@ if os.path.isfile(source):
 else:
     config = {"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [],
               "routing": {"domainStrategy": "AsIs", "rules": []}}
-inbounds, outbounds, rules = config["inbounds"], config["outbounds"], config["routing"]["rules"]
+inbounds, outbounds = config["inbounds"], config["outbounds"]
+rules = config.setdefault("routing", {}).setdefault("rules", [])
 action, entry_tag, outbound_tag = (os.environ[key] for key in ("ACTION", "ENTRY_TAG", "OUTBOUND_TAG"))
 nodes = [json.loads(node) for node in os.environ["NODES_DATA"].splitlines() if node]
 used = {int(line.split()[3].rsplit(":", 1)[1])
@@ -601,27 +602,34 @@ elif action == "delete-inbound":
     outbounds[:] = [out for out in outbounds if out["tag"] not in candidates or out["tag"] in referenced]
 else:
     inbound = next((item for item in inbounds if item["tag"] == entry_tag), None)
-    rule = next((item for item in rules if item.get("inboundTag") == [entry_tag]), None)
-    if not inbound or not rule:
-        raise SystemExit("入站或对应路由不存在。")
+    if not inbound:
+        raise SystemExit(f"节点（{entry_tag}）不存在。")
+    rule = next((item for item in rules if entry_tag in item.get("inboundTag", [])), None)
+    if not rule:
+        raise SystemExit(f"节点 {inbound.get('_remark', entry_tag)}（{entry_tag}）缺少对应路由。")
+    previous = rule["outboundTag"]
+    shared_route = len(rule["inboundTag"]) > 1
     prefix = f"socks5-{entry_tag}-"
     members = [out for out in outbounds if out["tag"].startswith(prefix)]
-    # 将上一版一对一的出站纳入该入口，保持其他入口的路由不变。
+    # 兼容没有按入口命名的旧出站。
     if not members:
         old = next((out for out in outbounds if out["tag"] == rule.get("outboundTag")), None)
-        if not old or old["protocol"] != "socks":
-            raise SystemExit("找不到该入口的 SOCKS5 出站。")
+        if not old or old["protocol"] not in ("socks", "vless"):
+            raise SystemExit("找不到该入口的 SOCKS5 或 VLESS 出站。")
         member = copy.deepcopy(old)
         member["tag"] = prefix + "1"
         outbounds.append(member)
-        previous = old["tag"]
         rule["outboundTag"] = member["tag"]
         if outbound_tag == previous:
             outbound_tag = member["tag"]
-        if not any(item.get("outboundTag") == previous for item in rules):
+        if not shared_route and not any(item.get("outboundTag") == previous for item in rules):
             outbounds.remove(old)
         members = [member]
     selected = next((out for out in members if out["tag"] == outbound_tag), None)
+    if selected and action in ("edit-outbound", "delete-outbound") and any(
+        item.get("outboundTag") == outbound_tag and (item is not rule or shared_route) for item in rules
+    ):
+        raise SystemExit(f"出站（{outbound_tag}）由其他路由或节点共用，无法单独编辑或删除。")
     if action == "add-outbounds":
         if not nodes:
             raise SystemExit("至少需要一个出站。")
@@ -696,6 +704,11 @@ else:
                 inbound["settings"]["ip"] = os.environ["VPS_IP"]
     else:
         raise SystemExit("未知操作。")
+    if shared_route and rule["outboundTag"] != previous:
+        # 保留原有匹配顺序和其他入站使用的出口。
+        rules.insert(rules.index(rule), dict(rule, inboundTag=[entry_tag]))
+        rule["inboundTag"].remove(entry_tag)
+        rule["outboundTag"] = previous
 with open(os.environ["NEW_CONFIG_FILE"], "w") as file:
     json.dump(config, file, indent=2)
 PYEOF
@@ -940,23 +953,27 @@ import json, sys
 
 config = json.load(open(sys.argv[1]))
 inbounds = config["inbounds"]
+rules = config.get("routing", {}).get("rules", [])
 if not inbounds:
     print("暂无节点，请先新增 VLESS 或 SOCKS5 节点。")
     sys.exit(0)
 for index, inbound in enumerate(inbounds, 1):
     tag = inbound["tag"]
-    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
-    members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
-    if not members:
-        members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
-    print(f"节点 {index}) {inbound.get('_remark', tag)}  "
-          f"{str(inbound.get('protocol', '-')).upper()} :{inbound.get('port', '-')}  出站 {len(members)} 个")
+    label = (f"节点 {index}) {inbound.get('_remark', tag)}  "
+             f"{str(inbound.get('protocol', '-')).upper()} :{inbound.get('port', '-')}")
+    rule = next((item for item in rules if tag in item.get("inboundTag", [])), None)
+    if not rule:
+        print(f"{label}  缺少对应路由（{tag}）")
+        continue
+    members = [out for out in config["outbounds"]
+               if out["tag"].startswith(f"socks5-{tag}-") or out["tag"] == rule["outboundTag"]]
+    print(f"{label}  出站 {len(members)} 个")
 PYEOF
 }
 
 show_node_detail() {
     local tag="$1" link
-    python3 - "$CONFIG_FILE" "$tag" <<'PYEOF'
+    python3 - "$CONFIG_FILE" "$tag" <<'PYEOF' || return 1
 import json, sys
 
 config = json.load(open(sys.argv[1]))
@@ -965,10 +982,12 @@ inbound = next((item for item in config["inbounds"] if item["tag"] == tag), None
 if not inbound:
     print("节点不存在。")
     sys.exit(1)
-rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
-members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
-if not members:
-    members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
+rules = config.get("routing", {}).get("rules", [])
+rule = next((item for item in rules if tag in item.get("inboundTag", [])), None)
+if not rule:
+    raise SystemExit(f"节点 {inbound.get('_remark', tag)}（{tag}）缺少对应路由。")
+members = [out for out in config["outbounds"]
+           if out["tag"].startswith(f"socks5-{tag}-") or out["tag"] == rule["outboundTag"]]
 settings = inbound.get("settings") or {}
 stream = inbound.get("streamSettings") or {}
 
@@ -1093,11 +1112,15 @@ select_outbound() {
     choices=$(python3 - "$CONFIG_FILE" "${SELECTED_ENTRY:-}" "${1:-}" <<'PYEOF'
 import json, sys
 config = json.load(open(sys.argv[1]))
+rules = config.get("routing", {}).get("rules", [])
 for inbound in config["inbounds"]:
     tag = inbound["tag"]
     if sys.argv[2] and tag != sys.argv[2]:
         continue
-    rule = next(item for item in config["routing"]["rules"] if item.get("inboundTag") == [tag])
+    rule = next((item for item in rules if tag in item.get("inboundTag", [])), None)
+    if not rule:
+        print(f"节点 {inbound.get('_remark', tag)}（{tag}）缺少对应路由。", file=sys.stderr)
+        continue
     members = [out for out in config["outbounds"] if out["tag"].startswith(f"socks5-{tag}-")]
     if not members:
         members = [out for out in config["outbounds"] if out["tag"] == rule["outboundTag"]]
@@ -1113,6 +1136,7 @@ PYEOF
 ) || return 1
     if [[ -z "$choices" ]]; then
         echo "没有可选出站；删除整条节点请选择主菜单 4。"
+        pause_return
         return 1
     fi
     while IFS= read -r row; do
@@ -1241,7 +1265,10 @@ manage_node_menu() {
     select_entry || return 0
     while true; do
         clear_screen
-        show_node_detail "$SELECTED_ENTRY" || return 1
+        if ! show_node_detail "$SELECTED_ENTRY"; then
+            pause_return
+            return 0
+        fi
         echo
         echo "1) 添加出站（SOCKS5 / VLESS）"
         echo "2) 切换当前出站"
@@ -1308,7 +1335,7 @@ manage_node_menu() {
 browse_menu() {
     select_entry "${1:-节点编号查看详情（0 返回）}" || return 0
     clear_screen
-    show_node_detail "$SELECTED_ENTRY" || return 0
+    show_node_detail "$SELECTED_ENTRY" || true
     pause_return
 }
 

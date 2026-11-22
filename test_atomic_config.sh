@@ -390,6 +390,39 @@ assert original["outbounds"][1] in current["outbounds"]
 assert current["routing"]["rules"][0]["outboundTag"] == "socks5-vless-in-1-1"
 assert len([out for out in current["outbounds"] if out["tag"].startswith("socks5-vless-in-1-")]) == 2
 PYEOF
+(
+    CONFIG_FILE="$TMP_DIR/shared-routing.json"
+    python3 - "$TMP_DIR/two-vless.json" "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+rules = config["routing"]["rules"]
+rules[0]["inboundTag"].extend(rules.pop()["inboundTag"])
+json.dump(config, open(sys.argv[2], "w"))
+PYEOF
+    show_nodes > "$TMP_DIR/shared-list.out"
+    grep -q '节点 2).*出站 2 个' "$TMP_DIR/shared-list.out"
+    show_node_detail vless-in-2 > "$TMP_DIR/shared-detail.out" 2>/dev/null
+    grep -Fq '[当前]' "$TMP_DIR/shared-detail.out"
+    SELECTED_ENTRY=vless-in-1
+    select_outbound > "$TMP_DIR/shared-choice.out" <<< 2
+    generate_config "$TMP_DIR/split-routing.json" switch-outbound "$SELECTED_ENTRY" "$SELECTED_OUTBOUND"
+    python3 - "$TMP_DIR/split-routing.json" "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+config = json.load(open(sys.argv[1]))
+rules = config["routing"]["rules"]
+assert [(rule["inboundTag"], rule["outboundTag"]) for rule in rules] == [
+    (["vless-in-1"], "socks5-vless-in-1-2"), (["vless-in-2"], "socks5-vless-in-1-1")]
+rules.pop(0)
+json.dump(config, open(sys.argv[2], "w"))
+PYEOF
+    show_nodes > "$TMP_DIR/missing-list.out"
+    grep -q '节点 1).*缺少对应路由（vless-in-1）' "$TMP_DIR/missing-list.out"
+    grep -q '节点 2).*出站 2 个' "$TMP_DIR/missing-list.out"
+    if show_node_detail vless-in-1 > "$TMP_DIR/missing-detail.out" 2>&1; then
+        echo '缺少路由的节点不得返回详情成功' >&2; exit 1
+    fi
+    grep -Fq '（vless-in-1）缺少对应路由。' "$TMP_DIR/missing-detail.out"
+)
 # SOCKS5 与 VLESS 共存，新增、切换和修改端口保留入站账号及其他入口。
 (
     CONFIG_FILE="$TMP_DIR/socks.json"
@@ -444,7 +477,7 @@ PYEOF
     apply_change add-outbounds socks-in-1 > "$TMP_DIR/vless-out-add.out"
     apply_change switch-outbound socks-in-1 socks5-socks-in-1-3 > "$TMP_DIR/vless-out-switch.out"
     show_node_detail socks-in-1 > "$TMP_DIR/vless-out-list.out" 2>/dev/null
-    grep -q 'VLESS 127.0.0.1:443 \[当前\]' "$TMP_DIR/vless-out-list.out"
+    grep -Fq 'VLESS 127.0.0.1:443  [当前]' "$TMP_DIR/vless-out-list.out"
     if [[ -n "$XRAY_TEST_BIN" ]]; then
         python3 test_socks_relay.py "$XRAY_TEST_BIN" "$CONFIG_FILE"
     fi
